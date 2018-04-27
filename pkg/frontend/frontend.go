@@ -29,7 +29,7 @@ func Start(httpConfig config.Http, mqttService mqtt.Broker) error {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/", homeHandler).Methods("GET")
-	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("frontend/static"))))
 	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
 
 	srv = &http.Server{
@@ -67,7 +67,7 @@ type homePage struct {
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
-	tmplSrc, err := ioutil.ReadFile("template/index.html")
+	tmplSrc, err := ioutil.ReadFile("frontend/template/index.html")
 	if err != nil {
 		log.Printf("unable to read template: %v", err)
 		w.WriteHeader(500)
