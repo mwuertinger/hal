@@ -1,0 +1,6 @@
+FROM alpine:latest
+
+COPY hau-amd64 /hau
+COPY frontend /frontend
+
+ENTRYPOINT ["/hau"]

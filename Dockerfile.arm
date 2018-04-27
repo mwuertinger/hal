@@ -1,0 +1,6 @@
+FROM arm32v6/alpine:latest
+
+COPY hau-arm /hau
+COPY frontend /frontend
+
+ENTRYPOINT ["/hau"]
