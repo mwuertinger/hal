@@ -28,12 +28,12 @@
     <div class="container">
     <h2>Home Automation Hub</h2>
 
-    <h2>Lamps</h2>
-    {{ range .Lamps }}
+    <h2>Switches</h2>
+    {{ range .Devices }}
     <div>
     <h3></h3>
-    <button type="button" class="btn btn-secondary" hau-device="{{ .Device }}" hau-action="on">{{ .Name }} on</button>
-    <button type="button" class="btn btn-secondary" hau-device="{{ .Device }}" hau-action="off">{{ .Name }} off</button>
+    <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="on">{{ .Name }} on</button>
+    <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="off">{{ .Name }} off</button>
     </div>
     {{ end }}
     </div>

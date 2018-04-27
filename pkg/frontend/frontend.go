@@ -10,18 +10,19 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/mwuertinger/hau/pkg/config"
+	"github.com/mwuertinger/hau/pkg/device"
 	"github.com/mwuertinger/hau/pkg/mqtt"
 	"github.com/pkg/errors"
 )
 
 var (
 	srv         *http.Server
-	mqttService mqtt.Service
+	mqttService mqtt.Broker
 )
 
 // Start starts the HTTP server listening on listenAddress in the format address:port. The function returns immediately
 // and calls log.Fatal() should an error occur.
-func Start(httpConfig config.Http, mqttService mqtt.Service) error {
+func Start(httpConfig config.Http, mqttService mqtt.Broker) error {
 	if srv != nil {
 		return errors.New("already started")
 	}
@@ -29,7 +30,7 @@ func Start(httpConfig config.Http, mqttService mqtt.Service) error {
 	r := mux.NewRouter()
 	r.HandleFunc("/", homeHandler).Methods("GET")
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-	r.HandleFunc("/api/{device}", socketHandler).Methods("PUT")
+	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
 
 	srv = &http.Server{
 		Handler:      r,
@@ -56,13 +57,13 @@ func Shutdown() error {
 	return srv.Shutdown(ctx)
 }
 
-type lamp struct {
-	Name   string
-	Device string
+type frontendDevice struct {
+	ID   string
+	Name string
 }
 
 type homePage struct {
-	Lamps []lamp
+	Devices []frontendDevice
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
@@ -80,11 +81,19 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	devices := device.List()
+	frontendDevices := make([]frontendDevice, len(devices), len(devices))
+	for i, d := range devices {
+		log.Printf("device=%v", d)
+		frontendDevices[i] = frontendDevice{
+			ID:   d.ID(),
+			Name: d.Name(),
+		}
+	}
+
 	w.WriteHeader(200)
 	err = tmpl.Execute(w, &homePage{
-		Lamps: []lamp{
-			{"Stehlampe", "socket01"},
-		},
+		Devices: frontendDevices,
 	})
 
 	if err != nil {
@@ -92,17 +101,16 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func socketHandler(w http.ResponseWriter, r *http.Request) {
+func switchHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("reading body failed: %v", err)
-		w.WriteHeader(500)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	device := vars["device"]
 	var status bool
 	switch string(body) {
 	case "on":
@@ -111,14 +119,29 @@ func socketHandler(w http.ResponseWriter, r *http.Request) {
 		status = false
 	default:
 		log.Printf("invalid status: %s", string(body))
-		w.WriteHeader(500)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Device: %s, Action: %s\n", device, string(body))
-	if err = mqttService.SendCommand(device, status); err != nil {
+	deviceId := vars["device"]
+	dev := device.Get(deviceId)
+	if dev == nil {
+		log.Printf("device not found: %s", deviceId)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	switchDev, success := dev.(device.Switch)
+	if !success {
+		log.Printf("device %s is not a switch", dev)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Device: %s, Target state: %b\n", switchDev, status)
+	if err = switchDev.Switch(status); err != nil {
 		log.Printf("send command failed: %v", err)
-		w.WriteHeader(500)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 

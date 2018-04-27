@@ -14,21 +14,21 @@ import (
 	gmq "github.com/yosssi/gmq/mqtt/client"
 )
 
-type Service interface {
+type Broker interface {
 	Connect(mqttConfig config.Mqtt) error
 	Disconnect() error
-	SendCommand(device string, status bool) error
+	Publish(topic string, msg string) error
 }
 
-type srv struct {
+type broker struct {
 	client *gmq.Client
 }
 
-func New() Service {
-	return &srv{}
+func New() Broker {
+	return &broker{}
 }
 
-func (s *srv) Connect(mqttConfig config.Mqtt) error {
+func (s *broker) Connect(mqttConfig config.Mqtt) error {
 	if s.client != nil {
 		return errors.New("already connected")
 	}
@@ -78,21 +78,14 @@ func (s *srv) Connect(mqttConfig config.Mqtt) error {
 	return nil
 }
 
-func (s *srv) Disconnect() error {
+func (s *broker) Disconnect() error {
 	return s.client.Disconnect()
 }
 
-func (s *srv) SendCommand(device string, status bool) error {
-	statusStr := ""
-	if status {
-		statusStr = "1"
-	} else {
-		statusStr = "0"
-	}
-
+func (s *broker) Publish(topic string, msg string) error {
 	return s.client.Publish(&gmq.PublishOptions{
 		QoS:       gmq_mqtt.QoS2,
-		TopicName: []byte(fmt.Sprintf("cmnd/%s/POWER", device)),
-		Message:   []byte(statusStr),
+		TopicName: []byte(topic),
+		Message:   []byte(msg),
 	})
 }

@@ -27,16 +27,16 @@ func TestUnmarshal(t *testing.T) {
 	}
 
 	expectedConfig := Config{
-		Mqtt: mqtt{
+		Mqtt: Mqtt{
 			CaPath:   "ca.crt",
 			Server:   "mqtt.example.com:1883",
 			User:     "foo",
 			Password: "bar",
 		},
-		Http: http{
+		Http: Http{
 			ListenAddress: "fizz:1234",
 		},
-		Devices: []device{
+		Devices: []Device{
 			{
 				ID:       "socket01",
 				Type:     "socket",

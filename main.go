@@ -5,24 +5,23 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"github.com/mwuertinger/hau/pkg/config"
+	"github.com/mwuertinger/hau/pkg/device"
 	"github.com/mwuertinger/hau/pkg/frontend"
 	"github.com/mwuertinger/hau/pkg/mqtt"
-	"github.com/yosssi/gmq/mqtt/client"
 )
-
-var cli *client.Client
 
 func main() {
 	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, os.Kill)
+	signal.Notify(sigc, os.Interrupt, os.Kill, syscall.SIGTERM)
 
 	configPath := flag.String("config", "", "Path to config file.")
 	flag.Parse()
 
 	if len(*configPath) < 1 {
-		log.Fatalf("Missing -config PATH argument.")
+		log.Fatalf("Missing -config argument.")
 	}
 
 	c, err := config.Load(*configPath)
@@ -30,12 +29,17 @@ func main() {
 		log.Fatalf("Failed to read config file: %v", err)
 	}
 
-	mqttService := mqtt.New()
-	if err := mqttService.Connect(c.Mqtt); err != nil {
-		log.Fatalf("mqttService.Connect: %v", err)
+	mqttBroker := mqtt.New()
+	if err := mqttBroker.Connect(c.Mqtt); err != nil {
+		log.Fatalf("mqttBroker.Connect: %v", err)
 	}
 
-	if err := frontend.Start(c.Http, mqttService); err != nil {
+	device.SetMqttBroker(mqttBroker)
+	if err := device.RegisterDevices(c.Devices); err != nil {
+		log.Fatalf("device.RegisterDevices: %v", err)
+	}
+
+	if err := frontend.Start(c.Http, mqttBroker); err != nil {
 		log.Fatalf("frontend.Start: %v", err)
 	}
 
@@ -46,8 +50,7 @@ func main() {
 		log.Printf("frontend.Shutdown: %v", err)
 	}
 
-	// Disconnect the Network Connection.
-	if err := mqttService.Disconnect(); err != nil {
-		log.Printf("mqttService.Disconnect: %v", err)
+	if err := mqttBroker.Disconnect(); err != nil {
+		log.Printf("mqttBroker.Disconnect: %v", err)
 	}
 }
