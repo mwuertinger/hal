@@ -12,12 +12,20 @@ import (
 
 	gmq_mqtt "github.com/yosssi/gmq/mqtt"
 	gmq "github.com/yosssi/gmq/mqtt/client"
+	"time"
 )
+
+type Notification struct {
+	Timestamp time.Time
+	Topic     string
+	Msg       string
+}
 
 type Broker interface {
 	Connect(mqttConfig config.Mqtt) error
 	Disconnect() error
 	Publish(topic string, msg string) error
+	Subscribe(topic string, c chan Notification) error
 }
 
 type broker struct {
@@ -65,16 +73,6 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 		return fmt.Errorf("connect failed: %v", err)
 	}
 
-	err = s.client.Subscribe(&gmq.SubscribeOptions{SubReqs: []*gmq.SubReq{{
-		TopicFilter: []byte("+/+/+"),
-		Handler: func(topicName, message []byte) {
-			log.Printf("%s: %s", string(topicName), string(message))
-		},
-	}}})
-	if err != nil {
-		return fmt.Errorf("subscribe failed: %v", err)
-	}
-
 	return nil
 }
 
@@ -88,4 +86,13 @@ func (s *broker) Publish(topic string, msg string) error {
 		TopicName: []byte(topic),
 		Message:   []byte(msg),
 	})
+}
+
+func (s *broker) Subscribe(topic string, c chan Notification) error {
+	return s.client.Subscribe(&gmq.SubscribeOptions{SubReqs: []*gmq.SubReq{{
+		TopicFilter: []byte(topic),
+		Handler: func(topicName, message []byte) {
+			c <- Notification{time.Now(), string(topicName), string(message)}
+		},
+	}}})
 }

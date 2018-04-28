@@ -20,21 +20,31 @@
                     data: action
                 })
             })
+
+            var connection = new WebSocket("ws://" + document.location.host + "/api/ws");
+            connection.onmessage = function (message) {
+                console.log("received: " + message.data)
+                var mqttLog = $("#mqttLog")
+                mqttLog.append(message.data + "<br>")
+            };
         })
     </script>
 </head>
 <body>
     <div class="container">
-    <h2>Home Automation Hub</h2>
+        <h2>Home Automation Hub</h2>
 
-    <h2>Switches</h2>
-    {{ range .Devices }}
-    <div>
-    <h3></h3>
-    <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="on">{{ .Name }} on</button>
-    <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="off">{{ .Name }} off</button>
-    </div>
-    {{ end }}
+        <h2>Switches</h2>
+        {{ range .Devices }}
+        <div>
+        <h3></h3>
+        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="on">{{ .Name }} on</button>
+        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="off">{{ .Name }} off</button>
+        </div>
+        {{ end }}
+
+        <h2>MQTT Log</h2>
+        <label id="mqttLog"></label>
     </div>
 </body>
 </html>

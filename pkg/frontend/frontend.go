@@ -8,29 +8,56 @@ import (
 	"net/http"
 	"time"
 
+	"fmt"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/mwuertinger/hau/pkg/device"
 	"github.com/mwuertinger/hau/pkg/mqtt"
 	"github.com/pkg/errors"
+	"sync"
 )
 
 var (
-	srv         *http.Server
-	mqttService mqtt.Broker
+	srv *http.Server
 )
 
 // Start starts the HTTP server listening on listenAddress in the format address:port. The function returns immediately
 // and calls log.Fatal() should an error occur.
-func Start(httpConfig config.Http, mqttService mqtt.Broker) error {
+func Start(httpConfig config.Http, ms mqtt.Broker) error {
 	if srv != nil {
 		return errors.New("already started")
 	}
+
+	wsConnections = make(map[*websocket.Conn]bool)
+
+	notificationChannel := make(chan mqtt.Notification)
+	if err := ms.Subscribe("+/+/+", notificationChannel); err != nil {
+		return fmt.Errorf("ms.Subscribe: %v", err)
+	}
+	go func() {
+		for {
+			n := <-notificationChannel
+
+			log.Printf("New notification: %v", n)
+
+			wsConnectionsMu.Lock()
+			for c := range wsConnections {
+				err := c.WriteJSON(n)
+				if err != nil {
+					log.Printf("c.WriteJSON: %v", err)
+					continue
+				}
+			}
+			wsConnectionsMu.Unlock()
+		}
+	}()
 
 	r := mux.NewRouter()
 	r.HandleFunc("/", homeHandler).Methods("GET")
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("frontend/static"))))
 	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
+	r.HandleFunc("/api/ws", wsHandler)
 
 	srv = &http.Server{
 		Handler:      r,
@@ -146,4 +173,25 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+var (
+	wsConnections   map[*websocket.Conn]bool
+	wsConnectionsMu sync.RWMutex
+)
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Upgrade(w, r, nil, 1024, 1024)
+	if err != nil {
+		log.Printf("websocket.Upgrade: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("New WS: %v", conn)
+
+	wsConnectionsMu.Lock()
+	defer wsConnectionsMu.Unlock()
+
+	wsConnections[conn] = true
 }
