@@ -1,6 +1,7 @@
 package device
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/mwuertinger/hau/pkg/mqtt"
 	"log"
@@ -11,6 +12,8 @@ type sonoffMqttSwitch struct {
 	device
 	lastKnownState bool
 	observers      []chan<- Event
+	shutdownChan   chan interface{}
+	wg             sync.WaitGroup
 	mu             sync.Mutex
 }
 
@@ -21,45 +24,104 @@ func NewSonoffMqttSwitch(id string, name string, location string) Switch {
 			name:     name,
 			location: location,
 		},
+		shutdownChan: make(chan interface{}),
 	}
 
-	notificationChan := make(chan mqtt.Notification)
-	if err := mqttBroker.Subscribe(fmt.Sprintf("stat/%s/POWER", id), notificationChan); err != nil {
+	powerChan, err := mqttBroker.Subscribe(fmt.Sprintf("stat/%s/POWER", id))
+	if err != nil {
+		log.Println("sonoffMqttSwitch.Observe: %v", err)
+	}
+	stateChan, err := mqttBroker.Subscribe(fmt.Sprintf("tele/%s/STATE", id))
+	if err != nil {
 		log.Println("sonoffMqttSwitch.Observe: %v", err)
 	}
 
-	go func() {
-		for notification := range notificationChan {
-			state, err := toState(notification.Msg)
-			if err != nil {
-				log.Print(err)
-				continue
-			}
+	dev.wg.Add(1)
 
-			event := Event{
-				Timestamp: notification.Timestamp,
-				DeviceId:  dev.id,
-				Payload:   EventPayloadSwitch{state},
-			}
-
-			dev.mu.Lock()
-			dev.lastKnownState = state
-			for _, observer := range dev.observers {
-				observer <- event
-			}
-			dev.mu.Unlock()
-		}
-
-		log.Println("sonoffMqttSwitch: observer shutting down")
-
-		dev.mu.Lock()
-		for _, observer := range dev.observers {
-			close(observer)
-		}
-		dev.mu.Unlock()
-	}()
+	go dev.notificationHandler(powerChan, stateChan)
 
 	return dev
+}
+
+func (s *sonoffMqttSwitch) notificationHandler(powerChan, stateChan <-chan mqtt.Notification) {
+	for {
+		select {
+		case notification, ok := <-powerChan:
+			if !ok {
+				goto shutdown
+			}
+			if err := s.processNotification(notification); err != nil {
+				log.Printf("processNotification: %v", err)
+			}
+
+		case notification, ok := <-stateChan:
+			if !ok {
+				goto shutdown
+			}
+			if err := s.processNotification(notification); err != nil {
+				log.Printf("processNotification: %v", err)
+			}
+		case <-s.shutdownChan:
+			goto shutdown
+		}
+	}
+
+shutdown:
+	s.mu.Lock()
+	for _, observer := range s.observers {
+		close(observer)
+	}
+	s.observers = nil
+	s.mu.Unlock()
+
+	log.Printf("%v: shutdown complete", s.id)
+	s.wg.Done()
+
+}
+
+func (s *sonoffMqttSwitch) processNotification(notification mqtt.Notification) error {
+	var state bool
+	var err error
+
+	if notification.Topic == fmt.Sprintf("tele/%s/STATE", s.id) {
+		// example: {"Time":"2018-04-29T09:03:46","Uptime":"5T12:40:16","Vcc":3.405,"POWER":"OFF","Wifi":{"AP":1,"SSId":"Miichsoft","RSSI":100,"APMac":"34:81:C4:07:12:78"}}}
+		var obj struct {
+			Power string `json:"POWER"`
+		}
+		err = json.Unmarshal([]byte(notification.Msg), &obj)
+		if err != nil {
+			return fmt.Errorf("unmarshal json: %v, json: %s", err, notification.Msg)
+		}
+
+		if obj.Power == "ON" {
+			state = true
+		} else if obj.Power == "OFF" {
+			state = false
+		} else {
+			return fmt.Errorf("invalid POWER: %s", obj.Power)
+		}
+
+	} else if notification.Topic == fmt.Sprintf("stat/%s/POWER", s.id) {
+		state, err = toState(notification.Msg)
+		if err != nil {
+			return err
+		}
+	}
+
+	event := Event{
+		Timestamp: notification.Timestamp,
+		DeviceId:  s.id,
+		Payload:   EventPayloadSwitch{state},
+	}
+
+	s.mu.Lock()
+	s.lastKnownState = state
+	for _, observer := range s.observers {
+		observer <- event
+	}
+	s.mu.Unlock()
+
+	return nil
 }
 
 func (s *sonoffMqttSwitch) ID() string {
@@ -103,4 +165,9 @@ func toState(str string) (bool, error) {
 	} else {
 		return false, fmt.Errorf("invalid switch state: %s", str)
 	}
+}
+
+func (s *sonoffMqttSwitch) Shutdown() {
+	close(s.shutdownChan)
+	s.wg.Wait()
 }

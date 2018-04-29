@@ -17,7 +17,9 @@ import (
 )
 
 var (
-	srv *http.Server
+	srv      *http.Server
+	shutdown chan interface{}
+	wg       sync.WaitGroup
 )
 
 // Start starts the HTTP server listening on listenAddress in the format address:port. The function returns immediately
@@ -29,24 +31,43 @@ func Start(httpConfig config.Http) error {
 
 	wsConnections = make(map[*websocket.Conn]bool)
 
+	shutdown = make(chan interface{})
 	eventChan := make(chan device.Event)
 	device.AddObserver(eventChan)
+	wg.Add(1)
+
 	go func() {
 		for {
-			event := <-eventChan
-
-			log.Printf("New event: %v", event)
-
-			wsConnectionsMu.Lock()
-			for c := range wsConnections {
-				err := c.WriteJSON(event)
-				if err != nil {
-					log.Printf("c.WriteJSON: %v", err)
-					continue
+			select {
+			case event, ok := <-eventChan:
+				if !ok {
+					goto shutdown
 				}
+
+				log.Printf("New event: %v", event)
+
+				wsConnectionsMu.Lock()
+				for c := range wsConnections {
+					err := c.WriteJSON(event)
+					if err != nil {
+						log.Printf("c.WriteJSON: %v", err)
+						continue
+					}
+				}
+				wsConnectionsMu.Unlock()
+			case <-shutdown:
+				goto shutdown
 			}
-			wsConnectionsMu.Unlock()
 		}
+
+	shutdown:
+		wsConnectionsMu.Lock()
+		for c := range wsConnections {
+			c.Close()
+		}
+		wsConnectionsMu.Unlock()
+		log.Printf("frontend: shutdown complete")
+		wg.Done()
 	}()
 
 	r := mux.NewRouter()
@@ -74,10 +95,15 @@ func Start(httpConfig config.Http) error {
 }
 
 // Shutdown the server waiting at most 5 seconds for in-flight connections to terminate.
-func Shutdown() error {
+func Shutdown() {
+	close(shutdown)
+	wg.Wait()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("frontend shutdown: %v", err)
+	}
 }
 
 type frontendDevice struct {

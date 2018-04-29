@@ -46,11 +46,7 @@ func main() {
 	// Wait for receiving a signal.
 	<-sigc
 
-	if err := frontend.Shutdown(); err != nil {
-		log.Printf("frontend.Shutdown: %v", err)
-	}
-
-	if err := mqttBroker.Disconnect(); err != nil {
-		log.Printf("mqttBroker.Disconnect: %v", err)
-	}
+	frontend.Shutdown()
+	mqttBroker.Shutdown()
+	device.Shutdown()
 }

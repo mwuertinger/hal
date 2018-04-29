@@ -17,6 +17,7 @@ type Device interface {
 	Name() string
 	Location() string
 	AddObserver(chan<- Event)
+	Shutdown()
 }
 
 type Switch interface {
@@ -87,5 +88,11 @@ func Get(id string) Device {
 func AddObserver(observer chan<- Event) {
 	for _, dev := range devices {
 		dev.AddObserver(observer)
+	}
+}
+
+func Shutdown() {
+	for _, dev := range devices {
+		dev.Shutdown()
 	}
 }

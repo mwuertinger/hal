@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"sync"
+	"time"
 
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/pkg/errors"
 
 	gmq_mqtt "github.com/yosssi/gmq/mqtt"
 	gmq "github.com/yosssi/gmq/mqtt/client"
-	"time"
 )
 
 type Notification struct {
@@ -23,19 +24,21 @@ type Notification struct {
 
 type Broker interface {
 	Connect(mqttConfig config.Mqtt) error
-	Disconnect() error
+	Shutdown()
 	Publish(topic string, msg string) error
-	Subscribe(topic string, c chan Notification) error
+	Subscribe(topic string) (<-chan Notification, error)
 }
 
 type broker struct {
-	client       *gmq.Client
-	shutdownChan chan interface{} // closed on shutdown
+	client        *gmq.Client
+	subscribers   []chan Notification
+	subscribersMu sync.Mutex
+	shutdown      chan interface{} // closed on shutdown
 }
 
 func New() Broker {
 	return &broker{
-		shutdownChan: make(chan interface{}),
+		shutdown: make(chan interface{}),
 	}
 }
 
@@ -79,10 +82,18 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 	return nil
 }
 
-func (s *broker) Disconnect() error {
-	log.Print("closing shutdownChan")
-	close(s.shutdownChan)
-	return s.client.Disconnect()
+func (s *broker) Shutdown() {
+	if err := s.client.Disconnect(); err != nil {
+		log.Printf("mqtt.Disconnect(): %v", err)
+	}
+
+	s.subscribersMu.Lock()
+	for _, subscriber := range s.subscribers {
+		close(subscriber)
+	}
+	s.subscribersMu.Unlock()
+
+	log.Printf("broker: shutdown complete")
 }
 
 func (s *broker) Publish(topic string, msg string) error {
@@ -93,16 +104,22 @@ func (s *broker) Publish(topic string, msg string) error {
 	})
 }
 
-func (s *broker) Subscribe(topic string, c chan Notification) error {
-	return s.client.Subscribe(&gmq.SubscribeOptions{SubReqs: []*gmq.SubReq{{
+func (s *broker) Subscribe(topic string) (<-chan Notification, error) {
+	c := make(chan Notification)
+
+	s.subscribersMu.Lock()
+	defer s.subscribersMu.Unlock()
+
+	err := s.client.Subscribe(&gmq.SubscribeOptions{SubReqs: []*gmq.SubReq{{
 		TopicFilter: []byte(topic),
 		Handler: func(topicName, message []byte) {
-			select {
-			case c <- Notification{time.Now(), string(topicName), string(message)}:
-			case <-s.shutdownChan:
-				log.Println("Subscribe: Closing channel")
-				close(c)
-			}
+			c <- Notification{time.Now(), string(topicName), string(message)}
 		},
 	}}})
+	if err != nil {
+		return nil, err
+	}
+
+	s.subscribers = append(s.subscribers, c)
+	return c, nil
 }
