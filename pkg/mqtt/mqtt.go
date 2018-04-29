@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"sync"
@@ -55,16 +56,7 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM(caCert)
 
-	// Create an MQTT Client.
-	s.client = gmq.New(&gmq.Options{
-		// Define the processing of the error handler.
-		ErrorHandler: func(err error) {
-			log.Printf("MQTT error: %v", err)
-		},
-	})
-
-	// Connect to the MQTT Server.
-	err = s.client.Connect(&gmq.ConnectOptions{
+	connectOpts := gmq.ConnectOptions{
 		Network: "tcp",
 		Address: mqttConfig.Server,
 		TLSConfig: &tls.Config{
@@ -74,10 +66,30 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 		ClientID: []byte(mqttConfig.User),
 		UserName: []byte(mqttConfig.User),
 		Password: []byte(mqttConfig.Password),
+	}
+
+	// Create an MQTT Client.
+	s.client = gmq.New(&gmq.Options{
+		// Define the processing of the error handler.
+		ErrorHandler: func(err error) {
+			log.Printf("MQTT error: %v", err)
+			if err == io.EOF {
+				log.Print("Trying to reconnect...")
+				err = s.client.Connect(&connectOpts)
+				if err != nil {
+					log.Fatalf("reconnect failed: %v", err)
+				}
+			}
+		},
 	})
+
+	// Connect to the MQTT Server.
+	err = s.client.Connect(&connectOpts)
 	if err != nil {
 		return fmt.Errorf("connect failed: %v", err)
 	}
+
+	log.Println("MQTT connection established")
 
 	return nil
 }
