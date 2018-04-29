@@ -2,6 +2,8 @@ package device
 
 import (
 	"fmt"
+	"log"
+
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/mwuertinger/hau/pkg/mqtt"
 )
@@ -45,6 +47,9 @@ func RegisterDevices(deviceConfig []config.Device) error {
 			return err
 		}
 	}
+
+	log.Println("Devices registered")
+
 	return nil
 }
 
@@ -95,4 +100,5 @@ func Shutdown() {
 	for _, dev := range devices {
 		dev.Shutdown()
 	}
+	log.Println("Devices shutdown complete")
 }
