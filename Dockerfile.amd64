@@ -3,4 +3,6 @@ FROM alpine:latest
 COPY hau-amd64 /hau
 COPY frontend /frontend
 
+VOLUME /config
 ENTRYPOINT ["/hau"]
+CMD ["-config", "/config/hau.yaml"]
