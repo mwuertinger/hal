@@ -6,16 +6,14 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
-	"fmt"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/mwuertinger/hau/pkg/device"
-	"github.com/mwuertinger/hau/pkg/mqtt"
 	"github.com/pkg/errors"
-	"sync"
 )
 
 var (
@@ -24,26 +22,24 @@ var (
 
 // Start starts the HTTP server listening on listenAddress in the format address:port. The function returns immediately
 // and calls log.Fatal() should an error occur.
-func Start(httpConfig config.Http, ms mqtt.Broker) error {
+func Start(httpConfig config.Http) error {
 	if srv != nil {
 		return errors.New("already started")
 	}
 
 	wsConnections = make(map[*websocket.Conn]bool)
 
-	notificationChannel := make(chan mqtt.Notification)
-	if err := ms.Subscribe("+/+/+", notificationChannel); err != nil {
-		return fmt.Errorf("ms.Subscribe: %v", err)
-	}
+	eventChan := make(chan device.Event)
+	device.AddObserver(eventChan)
 	go func() {
 		for {
-			n := <-notificationChannel
+			event := <-eventChan
 
-			log.Printf("New notification: %v", n)
+			log.Printf("New event: %v", event)
 
 			wsConnectionsMu.Lock()
 			for c := range wsConnections {
-				err := c.WriteJSON(n)
+				err := c.WriteJSON(event)
 				if err != nil {
 					log.Printf("c.WriteJSON: %v", err)
 					continue
@@ -85,8 +81,9 @@ func Shutdown() error {
 }
 
 type frontendDevice struct {
-	ID   string
-	Name string
+	ID    string
+	Name  string
+	State string
 }
 
 type homePage struct {
@@ -112,9 +109,21 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	frontendDevices := make([]frontendDevice, len(devices), len(devices))
 	for i, d := range devices {
 		log.Printf("device=%v", d)
+
+		state := ""
+		devSwitch, ok := d.(device.Switch)
+		if ok {
+			if devSwitch.LastKnownState() {
+				state = "Device is on"
+			} else {
+				state = "Device is off"
+			}
+		}
+
 		frontendDevices[i] = frontendDevice{
-			ID:   d.ID(),
-			Name: d.Name(),
+			ID:    d.ID(),
+			Name:  d.Name(),
+			State: state,
 		}
 	}
 

@@ -24,6 +24,17 @@
             var connection = new WebSocket("ws://" + document.location.host + "/api/ws");
             connection.onmessage = function (message) {
                 console.log("received: " + message.data)
+
+                var msg = JSON.parse(message.data)
+                var label = $("label[hau-device=" + msg.DeviceId + "]")
+                if (label != null) {
+                    if (msg.Payload.State == true) {
+                        label.text("Device is on")
+                    } else {
+                        label.text("Device is off")
+                    }
+                }
+
                 var mqttLog = $("#mqttLog")
                 mqttLog.append(message.data + "<br>")
             };
@@ -37,9 +48,10 @@
         <h2>Switches</h2>
         {{ range .Devices }}
         <div>
-        <h3></h3>
-        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="on">{{ .Name }} on</button>
-        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="off">{{ .Name }} off</button>
+        <h3>{{ .Name }}</h3>
+        <label hau-device="{{ .ID }}">{{ .State }}</label>
+        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="on">On</button>
+        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="off">Off</button>
         </div>
         {{ end }}
 

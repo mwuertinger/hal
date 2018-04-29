@@ -29,11 +29,14 @@ type Broker interface {
 }
 
 type broker struct {
-	client *gmq.Client
+	client       *gmq.Client
+	shutdownChan chan interface{} // closed on shutdown
 }
 
 func New() Broker {
-	return &broker{}
+	return &broker{
+		shutdownChan: make(chan interface{}),
+	}
 }
 
 func (s *broker) Connect(mqttConfig config.Mqtt) error {
@@ -77,6 +80,8 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 }
 
 func (s *broker) Disconnect() error {
+	log.Print("closing shutdownChan")
+	close(s.shutdownChan)
 	return s.client.Disconnect()
 }
 
@@ -92,7 +97,12 @@ func (s *broker) Subscribe(topic string, c chan Notification) error {
 	return s.client.Subscribe(&gmq.SubscribeOptions{SubReqs: []*gmq.SubReq{{
 		TopicFilter: []byte(topic),
 		Handler: func(topicName, message []byte) {
-			c <- Notification{time.Now(), string(topicName), string(message)}
+			select {
+			case c <- Notification{time.Now(), string(topicName), string(message)}:
+			case <-s.shutdownChan:
+				log.Println("Subscribe: Closing channel")
+				close(c)
+			}
 		},
 	}}})
 }

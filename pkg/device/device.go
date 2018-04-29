@@ -16,11 +16,13 @@ type Device interface {
 	ID() string
 	Name() string
 	Location() string
+	AddObserver(chan<- Event)
 }
 
 type Switch interface {
 	Device
 	Switch(status bool) error
+	LastKnownState() bool
 }
 
 var (
@@ -60,13 +62,7 @@ func addDevice(id, name, location, typ string) error {
 
 	switch typ {
 	case "sonoff-mqtt-switch":
-		dev = &sonoffMqttSwitch{
-			device: device{
-				id:       id,
-				name:     name,
-				location: location,
-			},
-		}
+		dev = NewSonoffMqttSwitch(id, name, location)
 	default:
 		return fmt.Errorf("invalid typ: %s", typ)
 	}
@@ -86,4 +82,10 @@ func List() []Device {
 
 func Get(id string) Device {
 	return devices[id]
+}
+
+func AddObserver(observer chan<- Event) {
+	for _, dev := range devices {
+		dev.AddObserver(observer)
+	}
 }

@@ -39,7 +39,7 @@ func main() {
 		log.Fatalf("device.RegisterDevices: %v", err)
 	}
 
-	if err := frontend.Start(c.Http, mqttBroker); err != nil {
+	if err := frontend.Start(c.Http); err != nil {
 		log.Fatalf("frontend.Start: %v", err)
 	}
 
