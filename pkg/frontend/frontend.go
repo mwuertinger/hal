@@ -14,7 +14,7 @@ import (
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/mwuertinger/hau/pkg/device"
 	"github.com/pkg/errors"
-	"io"
+	"net"
 )
 
 var (
@@ -50,15 +50,8 @@ func Start(httpConfig config.Http) error {
 				wsConnectionsMu.Lock()
 				for c := range wsConnections {
 					err := c.WriteJSON(event)
-					if err == io.EOF {
-						log.Printf("Closing WS due to EOF: %v", c.RemoteAddr())
-						if err := c.Close(); err != nil {
-							log.Printf("c.Close: %v", err)
-						}
-						delete(wsConnections, c)
-					} else if err != nil {
-						log.Printf("c.WriteJSON: %v", err)
-						continue
+					if err != nil {
+						log.Printf("WS %v: WriteJSON: %v", c.RemoteAddr(), err)
 					}
 				}
 				wsConnectionsMu.Unlock()
@@ -227,6 +220,22 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	go func() {
+		for {
+			_, _, err := conn.ReadMessage()
+			switch err.(type) {
+			case *websocket.CloseError:
+				log.Printf("CloseError: Removing WS %v", conn.RemoteAddr())
+				wsConnectionsMu.Lock()
+				delete(wsConnections, conn)
+				wsConnectionsMu.Unlock()
+				return
+			default:
+				log.Printf("Unknown WS error: %v", err)
+			}
+		}
+	}()
 
 	log.Printf("New WS: %v", conn.RemoteAddr())
 
