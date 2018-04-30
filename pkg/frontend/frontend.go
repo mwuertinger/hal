@@ -14,6 +14,7 @@ import (
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/mwuertinger/hau/pkg/device"
 	"github.com/pkg/errors"
+	"io"
 )
 
 var (
@@ -49,7 +50,13 @@ func Start(httpConfig config.Http) error {
 				wsConnectionsMu.Lock()
 				for c := range wsConnections {
 					err := c.WriteJSON(event)
-					if err != nil {
+					if err == io.EOF {
+						log.Printf("Closing WS due to EOF: %v", c.RemoteAddr())
+						if err := c.Close(); err != nil {
+							log.Printf("c.Close: %v", err)
+						}
+						delete(wsConnections, c)
+					} else if err != nil {
 						log.Printf("c.WriteJSON: %v", err)
 						continue
 					}
@@ -134,8 +141,6 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	devices := device.List()
 	frontendDevices := make([]frontendDevice, len(devices), len(devices))
 	for i, d := range devices {
-		log.Printf("device=%v", d)
-
 		state := ""
 		devSwitch, ok := d.(device.Switch)
 		if ok {
@@ -223,7 +228,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("New WS: %v", conn)
+	log.Printf("New WS: %v", conn.RemoteAddr())
 
 	wsConnectionsMu.Lock()
 	defer wsConnectionsMu.Unlock()
