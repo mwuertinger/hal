@@ -14,7 +14,6 @@ import (
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/mwuertinger/hau/pkg/device"
 	"github.com/pkg/errors"
-	"net"
 )
 
 var (
@@ -33,11 +32,11 @@ func Start(httpConfig config.Http) error {
 	wsConnections = make(map[*websocket.Conn]bool)
 
 	shutdown = make(chan interface{})
-	eventChan := make(chan device.Event)
-	device.AddObserver(eventChan)
 	wg.Add(1)
 
 	go func() {
+		eventChan := device.Events()
+
 		for {
 			select {
 			case event, ok := <-eventChan:
@@ -198,7 +197,7 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Device: %s, Target state: %b\n", switchDev, status)
+	log.Printf("Device: %s, Target state: %v\n", switchDev, status)
 	if err = switchDev.Switch(status); err != nil {
 		log.Printf("send command failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -224,15 +223,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		for {
 			_, _, err := conn.ReadMessage()
-			switch err.(type) {
-			case *websocket.CloseError:
-				log.Printf("CloseError: Removing WS %v", conn.RemoteAddr())
+			if err != nil {
+				log.Printf("ReadMessage() error: %v, Removing WS: %v", err, conn.RemoteAddr())
 				wsConnectionsMu.Lock()
 				delete(wsConnections, conn)
 				wsConnectionsMu.Unlock()
 				return
-			default:
-				log.Printf("Unknown WS error: %v", err)
 			}
 		}
 	}()

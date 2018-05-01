@@ -3,6 +3,9 @@ package device
 import (
 	"fmt"
 	"log"
+	"sort"
+	"strings"
+	"sync"
 
 	"github.com/mwuertinger/hau/pkg/config"
 	"github.com/mwuertinger/hau/pkg/mqtt"
@@ -18,7 +21,7 @@ type Device interface {
 	ID() string
 	Name() string
 	Location() string
-	AddObserver(chan<- Event)
+	Events() <-chan Event
 	Shutdown()
 }
 
@@ -83,6 +86,9 @@ func List() []Device {
 	for _, d := range devices {
 		list = append(list, d)
 	}
+	sort.Slice(list, func(i, j int) bool {
+		return strings.Compare(list[i].ID(), list[j].ID()) < 0
+	})
 	return list
 }
 
@@ -90,10 +96,27 @@ func Get(id string) Device {
 	return devices[id]
 }
 
-func AddObserver(observer chan<- Event) {
+func Events() <-chan Event {
+	out := make(chan Event)
+
+	var wg sync.WaitGroup
+	wg.Add(len(devices))
+
 	for _, dev := range devices {
-		dev.AddObserver(observer)
+		go func() {
+			for event := range dev.Events() {
+				out <- event
+			}
+			wg.Done()
+		}()
 	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
 }
 
 func Shutdown() {

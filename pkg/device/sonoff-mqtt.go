@@ -29,11 +29,11 @@ func NewSonoffMqttSwitch(id string, name string, location string) Switch {
 
 	powerChan, err := mqttBroker.Subscribe(fmt.Sprintf("stat/%s/POWER", id))
 	if err != nil {
-		log.Println("sonoffMqttSwitch.Observe: %v", err)
+		log.Printf("sonoffMqttSwitch.Observe: %v", err)
 	}
 	stateChan, err := mqttBroker.Subscribe(fmt.Sprintf("tele/%s/STATE", id))
 	if err != nil {
-		log.Println("sonoffMqttSwitch.Observe: %v", err)
+		log.Printf("sonoffMqttSwitch.Observe: %v", err)
 	}
 
 	dev.wg.Add(1)
@@ -145,10 +145,12 @@ func (s *sonoffMqttSwitch) Switch(state bool) error {
 	return mqttBroker.Publish(fmt.Sprintf("cmnd/%s/POWER", s.id), stateStr)
 }
 
-func (s *sonoffMqttSwitch) AddObserver(observer chan<- Event) {
+func (s *sonoffMqttSwitch) Events() <-chan Event {
+	observer := make(chan Event)
 	s.mu.Lock()
 	s.observers = append(s.observers, observer)
 	s.mu.Unlock()
+	return observer
 }
 
 func (s *sonoffMqttSwitch) LastKnownState() bool {

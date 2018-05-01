@@ -103,6 +103,7 @@ func (s *broker) Shutdown() {
 	for _, subscriber := range s.subscribers {
 		close(subscriber)
 	}
+	s.subscribers = nil
 	s.subscribersMu.Unlock()
 
 	log.Printf("broker: shutdown complete")
