@@ -11,6 +11,7 @@ import (
 	"github.com/mwuertinger/hau/pkg/device"
 	"github.com/mwuertinger/hau/pkg/frontend"
 	"github.com/mwuertinger/hau/pkg/mqtt"
+	"github.com/mwuertinger/hau/pkg/persistence"
 )
 
 func main() {
@@ -29,6 +30,11 @@ func main() {
 		log.Fatalf("Failed to read config file: %v", err)
 	}
 
+	persistence := persistence.GetInMemoryService()
+	if err := persistence.Start(); err != nil {
+		log.Fatalf("persistence.Start: %v", err)
+	}
+
 	mqttBroker := mqtt.New()
 	if err := mqttBroker.Connect(c.Mqtt); err != nil {
 		log.Fatalf("mqttBroker.Connect: %v", err)
@@ -43,8 +49,11 @@ func main() {
 		log.Fatalf("frontend.Start: %v", err)
 	}
 
+	log.Println("Server ready")
+
 	// Wait for receiving a signal.
-	<-sigc
+	sig := <-sigc
+	log.Printf("Received %v signal, shutting down...", sig)
 
 	frontend.Shutdown()
 	mqttBroker.Shutdown()
