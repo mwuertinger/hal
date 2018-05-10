@@ -3,7 +3,7 @@ package device
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/mwuertinger/hau/pkg/mqtt"
+	"github.com/mwuertinger/hal/pkg/mqtt"
 	"log"
 	"sync"
 )

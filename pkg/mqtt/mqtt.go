@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mwuertinger/hau/pkg/config"
+	"github.com/mwuertinger/hal/pkg/config"
 	"github.com/pkg/errors"
 
 	gmq_mqtt "github.com/yosssi/gmq/mqtt"

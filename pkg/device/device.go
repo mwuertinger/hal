@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mwuertinger/hau/pkg/config"
-	"github.com/mwuertinger/hau/pkg/mqtt"
+	"github.com/mwuertinger/hal/pkg/config"
+	"github.com/mwuertinger/hal/pkg/mqtt"
 )
 
 type device struct {

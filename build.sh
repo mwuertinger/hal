@@ -8,6 +8,6 @@ go test ./...
 for arch in arm amd64
 do
   echo "Building $arch"
-  CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -o hau-$arch
-  docker build -t hau-$arch -f Dockerfile.$arch .
+  CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -o hal-$arch
+  docker build -t hal-$arch -f Dockerfile.$arch .
 done

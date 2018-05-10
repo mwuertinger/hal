@@ -11,8 +11,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
-	"github.com/mwuertinger/hau/pkg/config"
-	"github.com/mwuertinger/hau/pkg/device"
+	"github.com/mwuertinger/hal/pkg/config"
+	"github.com/mwuertinger/hal/pkg/device"
 	"github.com/pkg/errors"
 )
 

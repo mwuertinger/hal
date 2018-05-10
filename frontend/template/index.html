@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
 
-    <title>Home Automation Hub</title>
+    <title>HAL - Home Automation Link</title>
 
     <link rel="stylesheet" href="/static/css/bootstrap.min.css">
     <script src="/static/js/jquery-3.3.1.min.js"></script>
@@ -12,8 +12,8 @@
     <script>
         $(document).ready(function() {
             $("button").on("click", function (event) {
-                device = event.target.getAttribute("hau-device")
-                action = event.target.getAttribute("hau-action")
+                device = event.target.getAttribute("hal-device")
+                action = event.target.getAttribute("hal-action")
                 $.ajax({
                     url: "/api/" + device,
                     type: 'PUT',
@@ -26,7 +26,7 @@
                 console.log("received: " + message.data)
 
                 var msg = JSON.parse(message.data)
-                var label = $("label[hau-device=" + msg.DeviceId + "]")
+                var label = $("label[hal-device=" + msg.DeviceId + "]")
                 if (label != null) {
                     if (msg.Payload.State == true) {
                         label.text("Device is on")
@@ -49,9 +49,9 @@
         {{ range .Devices }}
         <div>
         <h3>{{ .Name }}</h3>
-        <label hau-device="{{ .ID }}">{{ .State }}</label>
-        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="on">On</button>
-        <button type="button" class="btn btn-secondary" hau-device="{{ .ID }}" hau-action="off">Off</button>
+        <label hal-device="{{ .ID }}">{{ .State }}</label>
+        <button type="button" class="btn btn-secondary" hal-device="{{ .ID }}" hal-action="on">On</button>
+        <button type="button" class="btn btn-secondary" hal-device="{{ .ID }}" hal-action="off">Off</button>
         </div>
         {{ end }}
 

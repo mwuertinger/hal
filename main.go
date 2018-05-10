@@ -7,11 +7,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/mwuertinger/hau/pkg/config"
-	"github.com/mwuertinger/hau/pkg/device"
-	"github.com/mwuertinger/hau/pkg/frontend"
-	"github.com/mwuertinger/hau/pkg/mqtt"
-	"github.com/mwuertinger/hau/pkg/persistence"
+	"github.com/mwuertinger/hal/pkg/config"
+	"github.com/mwuertinger/hal/pkg/device"
+	"github.com/mwuertinger/hal/pkg/frontend"
+	"github.com/mwuertinger/hal/pkg/mqtt"
+	"github.com/mwuertinger/hal/pkg/persistence"
 )
 
 func main() {

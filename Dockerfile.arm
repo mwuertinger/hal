@@ -1,8 +1,8 @@
 FROM arm32v6/alpine:latest
 
-COPY hau-arm /hau
+COPY hal-arm /hal
 COPY frontend /frontend
 
 VOLUME /config
-ENTRYPOINT ["/hau"]
-CMD ["-config", "/config/hau.yaml"]
+ENTRYPOINT ["/hal"]
+CMD ["-config", "/config/hal.yaml"]

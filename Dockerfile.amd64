@@ -1,8 +1,8 @@
 FROM alpine:latest
 
-COPY hau-amd64 /hau
+COPY hal-amd64 /hal
 COPY frontend /frontend
 
 VOLUME /config
-ENTRYPOINT ["/hau"]
-CMD ["-config", "/config/hau.yaml"]
+ENTRYPOINT ["/hal"]
+CMD ["-config", "/config/hal.yaml"]
