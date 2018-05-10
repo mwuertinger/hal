@@ -1,0 +1,11 @@
+version: 2
+jobs:
+  build:
+    docker:
+      - image: circleci/golang:1.9
+    working_directory: /go/src/github.com/mwuertinger/hal
+    steps:
+      - checkout
+      - run: test -z "$(find -name '*.go' | tee /dev/stdout | xargs gofmt -l)"
+      - run: go install -v ./...
+      - run: go test -v ./...
