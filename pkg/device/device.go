@@ -103,12 +103,12 @@ func Events() <-chan Event {
 	wg.Add(len(devices))
 
 	for _, dev := range devices {
-		go func() {
-			for event := range dev.Events() {
+		go func(d Device) {
+			for event := range d.Events() {
 				out <- event
 			}
 			wg.Done()
-		}()
+		}(dev)
 	}
 
 	go func() {
