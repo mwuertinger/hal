@@ -5,8 +5,6 @@ jobs:
       - image: golang:1.11rc2
     steps:
       - checkout
-      - run: go version
-      - run: go env
       - run: test -z "$(find -name '*.go' | tee /dev/stdout | xargs gofmt -l)"
       - run: go build -v .
       - run: go test -v ./...
