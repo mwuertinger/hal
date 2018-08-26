@@ -4,9 +4,10 @@ jobs:
     docker:
       - image: golang:1.11rc2
     working_directory: /go/src/github.com/mwuertinger/hal
+    environment:
+      GO111MODULE: on
     steps:
       - checkout
-      - run: export GO111MODULE=on
       - run: go version
       - run: go env
       - run: test -z "$(find -name '*.go' | tee /dev/stdout | xargs gofmt -l)"
