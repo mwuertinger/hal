@@ -3,9 +3,6 @@ jobs:
   build:
     docker:
       - image: golang:1.11rc2
-    working_directory: /go/src/github.com/mwuertinger/hal
-    environment:
-      GO111MODULE: "on"
     steps:
       - checkout
       - run: go version
