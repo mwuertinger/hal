@@ -2,12 +2,12 @@ version: 2
 jobs:
   build:
     docker:
-      - image: circleci/golang:1.9
+      - image: circleci/golang:1.11
     working_directory: /go/src/github.com/mwuertinger/hal
     steps:
       - checkout
+      - run: export GO111MODULE=on
       - run: test -z "$(find -name '*.go' | tee /dev/stdout | xargs gofmt -l)"
-      - run: go get -v ./...
-      - run: go install -v ./...
+      - run: go build -v .
       - run: go test -v ./...
       - run: go vet ./...
