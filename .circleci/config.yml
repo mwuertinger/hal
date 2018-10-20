@@ -2,7 +2,7 @@ version: 2
 jobs:
   build:
     docker:
-      - image: golang:1.11rc2
+      - image: golang:1.11
     steps:
       - checkout
       - run: test -z "$(find -name '*.go' | tee /dev/stdout | xargs gofmt -l)"
