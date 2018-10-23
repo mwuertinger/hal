@@ -6,12 +6,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mwuertinger/hal/pkg/config"
 	"github.com/mwuertinger/hal/pkg/device"
 	"github.com/mwuertinger/hal/pkg/frontend"
 	"github.com/mwuertinger/hal/pkg/mqtt"
 	"github.com/mwuertinger/hal/pkg/persistence"
+	"github.com/mwuertinger/hal/pkg/timer"
 )
 
 func main() {
@@ -35,6 +37,11 @@ func main() {
 		log.Fatalf("persistence.Start: %v", err)
 	}
 
+	timerSvc := timer.NewService()
+	if err := timerSvc.Start(); err != nil {
+		log.Fatalf("timerSvc.Start: %v", err)
+	}
+
 	mqttBroker := mqtt.New()
 	if err := mqttBroker.Connect(c.Mqtt); err != nil {
 		log.Fatalf("mqttBroker.Connect: %v", err)
@@ -48,6 +55,13 @@ func main() {
 	if err := frontend.Start(c.Http); err != nil {
 		log.Fatalf("frontend.Start: %v", err)
 	}
+
+	// TODO remove
+	timerSvc.AddJob(timer.Job{
+		Timestamp: time.Now().Add(1 * time.Minute),
+		Status:    false,
+		Switches:  []device.Switch{device.Get("socket01").(device.Switch)},
+	})
 
 	log.Println("Server ready")
 
