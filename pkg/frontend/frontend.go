@@ -16,6 +16,10 @@ import (
 	"github.com/pkg/errors"
 )
 
+const (
+	AllId = "all" // pseudo-device ID representing all devices
+)
+
 var (
 	srv      *http.Server
 	shutdown chan interface{}
@@ -131,7 +135,13 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	devices := device.List()
-	frontendDevices := make([]frontendDevice, len(devices), len(devices))
+	frontendDevices := make([]frontendDevice, len(devices)+1, len(devices)+1)
+	frontendDevices[0] = frontendDevice{
+		ID:    "all",
+		Name:  "All",
+		State: "",
+	}
+
 	for i, d := range devices {
 		state := ""
 		devSwitch, ok := d.(device.Switch)
@@ -183,25 +193,42 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	deviceId := vars["device"]
-	dev := device.Get(deviceId)
-	if dev == nil {
-		log.Printf("device not found: %s", deviceId)
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
+	if deviceId == AllId {
+		isErr := false
+		for _, dev := range device.List() {
+			switchDev, success := dev.(device.Switch)
+			if !success {
+				continue
+			}
+			if err := switchDev.Switch(status); err != nil {
+				log.Printf("send command failed: %v", err)
+				isErr = true
+			}
+		}
+		if isErr {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	} else {
+		dev := device.Get(deviceId)
+		if dev == nil {
+			log.Printf("device not found: %s", deviceId)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 
-	switchDev, success := dev.(device.Switch)
-	if !success {
-		log.Printf("device %s is not a switch", dev)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+		switchDev, success := dev.(device.Switch)
+		if !success {
+			log.Printf("device %s is not a switch", dev)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 
-	log.Printf("Device: %s, Target state: %v\n", switchDev, status)
-	if err = switchDev.Switch(status); err != nil {
-		log.Printf("send command failed: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+		log.Printf("Device: %s, Target state: %v\n", switchDev, status)
+		if err = switchDev.Switch(status); err != nil {
+			log.Printf("send command failed: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
