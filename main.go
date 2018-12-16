@@ -57,10 +57,14 @@ func main() {
 	}
 
 	// TODO remove
+	var switches []device.Switch
+	for _, dev := range device.List() {
+		switches = append(switches, dev.(device.Switch))
+	}
 	timerSvc.AddJob(timer.Job{
-		Timestamp: time.Now().Add(1 * time.Minute),
-		Status:    false,
-		Switches:  []device.Switch{device.Get("socket01").(device.Switch)},
+		Timestamp: time.Date(2018, 10, 26, 5, 0, 0, 0, time.UTC),
+		Status:    true,
+		Switches:  switches,
 	})
 
 	log.Println("Server ready")

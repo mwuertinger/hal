@@ -40,7 +40,6 @@ func (s *service) Start() error {
 
 	go func() {
 		for now := range time.Tick(time.Minute) {
-			log.Print("Timer tick: ", now)
 			s.mu.Lock()
 			log.Print("Timer.jobs: ", s.jobs)
 			for id, job := range s.jobs {
