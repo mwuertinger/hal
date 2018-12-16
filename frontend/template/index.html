@@ -40,6 +40,12 @@
             };
         })
     </script>
+
+    <style>
+        .switch label {
+            width: 100px;
+        }
+    </style>
 </head>
 <body>
     <div class="container">
@@ -47,7 +53,7 @@
 
         <h2>Switches</h2>
         {{ range .Devices }}
-        <div>
+        <div class="switch">
         <h3>{{ .Name }}</h3>
         <label hal-device="{{ .ID }}">{{ .State }}</label>
         <button type="button" class="btn btn-secondary" hal-device="{{ .ID }}" hal-action="on">On</button>

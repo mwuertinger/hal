@@ -153,7 +153,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		frontendDevices[i] = frontendDevice{
+		frontendDevices[i+1] = frontendDevice{
 			ID:    d.ID(),
 			Name:  d.Name(),
 			State: state,
