@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"context"
+	"fmt"
 	"html/template"
 	"io/ioutil"
 	"log"
@@ -145,7 +146,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 
 		frontendDevices[i] = frontendDevice{
 			ID:    d.ID(),
-			Name:  d.Name(),
+			Name:  fmt.Sprintf("%s - %s", d.Location(), d.Name()),
 			State: state,
 		}
 	}
