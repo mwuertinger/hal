@@ -2,11 +2,11 @@ package frontend
 
 import (
 	"context"
-	"fmt"
 	"html/template"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -106,6 +106,11 @@ func Shutdown() {
 	}
 }
 
+type frontendRoom struct {
+	Name    string
+	Devices []frontendDevice
+}
+
 type frontendDevice struct {
 	ID    string
 	Name  string
@@ -113,7 +118,7 @@ type frontendDevice struct {
 }
 
 type homePage struct {
-	Devices []frontendDevice
+	Rooms []frontendRoom
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
@@ -131,9 +136,15 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	devices := device.List()
-	frontendDevices := make([]frontendDevice, len(devices), len(devices))
-	for i, d := range devices {
+	rooms := make(map[string]*frontendRoom)
+	for _, d := range device.List() {
+		if _, ok := rooms[d.Location()]; !ok {
+			rooms[d.Location()] = &frontendRoom{
+				Name: d.Location(),
+			}
+		}
+		room := rooms[d.Location()]
+
 		state := ""
 		devSwitch, ok := d.(device.Switch)
 		if ok {
@@ -144,16 +155,24 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		frontendDevices[i] = frontendDevice{
+		room.Devices = append(rooms[d.Location()].Devices, frontendDevice{
 			ID:    d.ID(),
-			Name:  fmt.Sprintf("%s - %s", d.Location(), d.Name()),
+			Name:  d.Name(),
 			State: state,
-		}
+		})
 	}
+
+	var frontendRooms []frontendRoom
+	for _, room := range rooms {
+		frontendRooms = append(frontendRooms, *room)
+	}
+	sort.Slice(frontendRooms, func(i, j int) bool {
+		return frontendRooms[i].Name < frontendRooms[j].Name
+	})
 
 	w.WriteHeader(200)
 	err = tmpl.Execute(w, &homePage{
-		Devices: frontendDevices,
+		Rooms: frontendRooms,
 	})
 
 	if err != nil {

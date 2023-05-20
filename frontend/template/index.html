@@ -43,9 +43,10 @@
 </head>
 <body>
     <div class="container">
-        <h2>Home Automation Link</h2>
+        <h1>Home Automation Link 9000</h1>
 
-        <h2>Switches</h2>
+        {{ range .Rooms }}
+        <h2>{{ .Name }}</h2>
         {{ range .Devices }}
         <div>
         <h3>{{ .Name }}</h3>
@@ -53,6 +54,7 @@
         <button type="button" class="btn btn-secondary" hal-device="{{ .ID }}" hal-action="on">On</button>
         <button type="button" class="btn btn-secondary" hal-device="{{ .ID }}" hal-action="off">Off</button>
         </div>
+        {{ end }}
         {{ end }}
 
         <h2>MQTT Log</h2>

@@ -136,3 +136,25 @@ func (s *broker) Subscribe(topic string) (<-chan Notification, error) {
 	s.subscribers = append(s.subscribers, c)
 	return c, nil
 }
+
+type fakeBroker struct {
+}
+
+func (s *fakeBroker) Subscribe(topic string) (<-chan Notification, error) {
+	return make(chan Notification), nil
+}
+
+func (s *fakeBroker) Connect(mqttConfig config.Mqtt) error {
+	return nil
+}
+
+func (s *fakeBroker) Shutdown() {
+}
+
+func (s *fakeBroker) Publish(topic string, msg string) error {
+	return nil
+}
+
+func NewFake() Broker {
+	return &fakeBroker{}
+}

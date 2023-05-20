@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"github.com/mwuertinger/hal/pkg/mqtt"
 	"log"
 	"os"
 	"os/signal"
@@ -10,7 +11,6 @@ import (
 	"github.com/mwuertinger/hal/pkg/config"
 	"github.com/mwuertinger/hal/pkg/device"
 	"github.com/mwuertinger/hal/pkg/frontend"
-	"github.com/mwuertinger/hal/pkg/mqtt"
 	"github.com/mwuertinger/hal/pkg/persistence"
 )
 
@@ -35,7 +35,7 @@ func main() {
 		log.Fatalf("persistence.Start: %v", err)
 	}
 
-	mqttBroker := mqtt.New()
+	mqttBroker := mqtt.NewFake()
 	if err := mqttBroker.Connect(c.Mqtt); err != nil {
 		log.Fatalf("mqttBroker.Connect: %v", err)
 	}
