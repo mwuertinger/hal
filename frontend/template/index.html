@@ -12,13 +12,12 @@
     <script src="/static/js/bootstrap.bundle.min.js"></script>
     <script>
         $(document).ready(function() {
-            $("button").on("click", function (event) {
+            $("input").on("click", function (event) {
                 device = event.target.getAttribute("hal-device")
-                action = event.target.getAttribute("hal-action")
                 $.ajax({
                     url: "/api/" + device,
                     type: 'PUT',
-                    data: action
+                    data: event.target.checked.toString()
                 })
             })
 
@@ -27,13 +26,9 @@
                 console.log("received: " + message.data)
 
                 var msg = JSON.parse(message.data)
-                var label = $("label[hal-device=" + msg.DeviceId + "]")
-                if (label != null) {
-                    if (msg.Payload.State == true) {
-                        label.text("Device is on")
-                    } else {
-                        label.text("Device is off")
-                    }
+                var toggle = $("input[hal-device=" + msg.DeviceId + "]")
+                if (toggle != null) {
+                    toggle.prop("checked", msg.Payload.State)
                 }
 
                 var mqttLog = $("#mqttLog")
@@ -51,9 +46,10 @@
         {{ range .Devices }}
         <div>
         <h3>{{ .Name }}</h3>
-        <label hal-device="{{ .ID }}">{{ .State }}</label>
-        <button type="button" class="btn btn-secondary" hal-device="{{ .ID }}" hal-action="on">On</button>
-        <button type="button" class="btn btn-secondary" hal-device="{{ .ID }}" hal-action="off">Off</button>
+        <label class="switch">
+            <input type="checkbox" hal-device="{{ .ID }}" {{ if .State }}checked="checked"{{ end }}>
+            <span class="slider round"></span>
+        </label>
         </div>
         {{ end }}
         {{ end }}

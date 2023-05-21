@@ -3,6 +3,7 @@ package frontend
 import (
 	"context"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -114,7 +115,7 @@ type frontendRoom struct {
 type frontendDevice struct {
 	ID    string
 	Name  string
-	State string
+	State bool
 }
 
 type homePage struct {
@@ -144,21 +145,11 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		room := rooms[d.Location()]
-
-		state := ""
-		devSwitch, ok := d.(device.Switch)
-		if ok {
-			if devSwitch.LastKnownState() {
-				state = "Device is on"
-			} else {
-				state = "Device is off"
-			}
-		}
-
+		devSwitch := d.(device.Switch)
 		room.Devices = append(rooms[d.Location()].Devices, frontendDevice{
 			ID:    d.ID(),
 			Name:  d.Name(),
-			State: state,
+			State: devSwitch.LastKnownState(),
 		})
 	}
 
@@ -183,7 +174,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 func switchHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("reading body failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -192,9 +183,9 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 
 	var status bool
 	switch string(body) {
-	case "on":
+	case "true":
 		status = true
-	case "off":
+	case "false":
 		status = false
 	default:
 		log.Printf("invalid status: %s", string(body))
