@@ -35,7 +35,7 @@ func main() {
 		log.Fatalf("persistence.Start: %v", err)
 	}
 
-	mqttBroker := mqtt.NewFake()
+	mqttBroker := mqtt.New()
 	if err := mqttBroker.Connect(c.Mqtt); err != nil {
 		log.Fatalf("mqttBroker.Connect: %v", err)
 	}
