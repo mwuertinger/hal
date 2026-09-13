@@ -1,0 +1,25 @@
+mqtt:
+  # Address of the MQTT broker. The connection is TLS.
+  server:         mqtt.example.com:8883
+  # CA certificate used to verify the broker.
+  ca-path:        /etc/hal/ca.crt
+  user:           hal
+  password:       changeme
+
+http:
+  # Address the web frontend listens on. Must match SocketBindAllow= in
+  # hal.service, which allows tcp:8080 by default.
+  listen-address: :8080
+
+# sonoff-mqtt-switch is currently the only supported device type. The id is the
+# Tasmota topic name: HAL publishes to cmnd/<id>/POWER and subscribes to
+# stat/<id>/POWER and tele/<id>/STATE. Devices are grouped by location in the UI.
+devices:
+- id:       socket01
+  type:     sonoff-mqtt-switch
+  name:     Floor Lamp
+  location: Living Room
+- id:       socket02
+  type:     sonoff-mqtt-switch
+  name:     Desk Lamp
+  location: Office

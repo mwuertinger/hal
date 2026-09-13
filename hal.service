@@ -1,0 +1,164 @@
+[Unit]
+Description=HAL - Home Automation Link
+Documentation=https://github.com/mwuertinger/hal
+After=network-online.target
+Wants=network-online.target
+
+# A broker that is down for hours is a normal condition for this service (see
+# Restart= below), so disable the start rate limit rather than let repeated
+# restarts leave the unit dead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/hal -config /etc/hal/hal.yaml
+User=hal
+Group=hal
+
+# HAL calls log.Fatalf() if the MQTT broker is unreachable at startup, so a broker
+# that is not up yet is a normal, recoverable condition.
+Restart=on-failure
+RestartSec=5s
+
+SyslogIdentifier=hal
+
+# ---------------------------------------------------------------------------
+# Capabilities and privileges
+#
+# HAL needs none at all: it binds an unprivileged port, reads two files and
+# talks TCP. Empty CapabilityBoundingSet= drops every capability from the
+# bounding set, so nothing can be regained.
+#
+# Listening on a port below 1024 is NOT just a matter of granting
+# CAP_NET_BIND_SERVICE. A capability held inside the private user namespace
+# only authorizes operations on objects owned by that namespace, and bind() is
+# checked against the host's network namespace, so the bind still fails with
+# EPERM. Prefer keeping an unprivileged port behind a reverse proxy, or lower
+# the threshold system-wide with
+#   sysctl net.ipv4.ip_unprivileged_port_start=80
+# If you must bind directly, all four of these are required together: remove
+# PrivateUsers=yes, add CAP_NET_BIND_SERVICE to both AmbientCapabilities= and
+# CapabilityBoundingSet=, and update SocketBindAllow= below.
+#
+# PrivateUsers=yes is also the one directive here with a hard kernel
+# dependency (CONFIG_USER_NS plus a non-zero user.max_user_namespaces). It
+# fails loudly at namespace setup if unavailable; drop it if you are on an old
+# or custom kernel.
+# ---------------------------------------------------------------------------
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+PrivateUsers=yes
+LockPersonality=yes
+KeyringMode=private
+
+# ---------------------------------------------------------------------------
+# Filesystem
+#
+# The binary embeds its own frontend assets and keeps all state in memory
+# (pkg/persistence is an in-memory sync.Map), so HAL never needs to write
+# anywhere. ProtectSystem=strict makes the whole filesystem read-only and no
+# ReadWritePaths= is granted, so the service has no writable path at all.
+# ---------------------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateMounts=yes
+UMask=0077
+
+# /etc/hal holds hal.yaml and the MQTT CA certificate it points at; those are
+# the only files HAL reads. Redundant under ProtectSystem=strict, but stated
+# explicitly so the service's entire data dependency is visible here.
+ReadOnlyPaths=/etc/hal
+
+# The binary is statically linked (build.sh sets CGO_ENABLED=0), so nothing
+# but the executable itself ever needs to be mapped executable.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/hal
+MemoryDenyWriteExecute=yes
+
+# Only the kernel API filesystems plus the one holding / and /etc/hal. ext4 is
+# the Raspberry Pi OS default and also covers ext2/ext3; tmpfs is reachable via
+# devtmpfs, which shares its superblock magic. CHANGE IT if your root
+# filesystem differs, or drop this line if unsure. The likely case on a Pi is
+# "overlay": raspi-config's Overlay File System option makes / an overlayfs to
+# spare the SD card, and every open including the binary itself would then be
+# denied. btrfs, xfs and f2fs need the same treatment.
+#
+# Needs systemd >= 250 and the BPF LSM; where unsupported systemd logs a
+# warning and carries on, so the line is inert rather than fatal. Check with
+# "cat /sys/kernel/security/lsm" — it only does anything if bpf is listed.
+RestrictFileSystems=@basic-api ext4
+
+# ---------------------------------------------------------------------------
+# Kernel, devices and host
+# ---------------------------------------------------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+DevicePolicy=closed
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+
+# ---------------------------------------------------------------------------
+# System calls
+#
+# @privileged and @resources are the only two groups @system-service actually
+# pulls in, so subtracting anything else would be a no-op. @resources is
+# returned as EPERM rather than SIGSYS purely as a belt-and-braces measure: Go
+# only calls setrlimit() when the soft and hard RLIMIT_NOFILE differ (they do
+# not, LimitNOFILE= below sets a single value) and discards its return value
+# either way, but EPERM keeps that true if anyone later sets a soft:hard pair.
+# ---------------------------------------------------------------------------
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources:EPERM
+
+# ---------------------------------------------------------------------------
+# Network
+#
+# Netlink is only reached from net.Interfaces/InterfaceAddrs and the IPv6 zone
+# cache, none of which HAL uses; the zone cache degrades to a numeric zone id
+# anyway, so AF_NETLINK is not granted. AF_UNIX is not listed either because
+# the static build uses the pure-Go resolver and Type=exec needs no sd_notify
+# socket; add it if you ever build HAL with cgo (NSS/nscd needs a unix socket).
+# ---------------------------------------------------------------------------
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# HAL only ever listens on its one HTTP port; everything else is outbound.
+# This MUST match the port in hal.yaml's http.listen-address.
+SocketBindDeny=any
+SocketBindAllow=tcp:8080
+
+# Confine traffic to loopback and RFC1918/link-local, which covers a broker and
+# a DNS resolver on the LAN. The likeliest way this bites is DNS, not the
+# broker: a stock /etc/resolv.conf pointing at a public resolver such as
+# 1.1.1.1 or 8.8.8.8 is outside these ranges. The symptom is an unusual
+# "connect: permission denied" on startup — add the address here if so.
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=10.0.0.0/8
+IPAddressAllow=172.16.0.0/12
+IPAddressAllow=192.168.0.0/16
+IPAddressAllow=169.254.0.0/16
+IPAddressAllow=fd00::/8
+IPAddressAllow=fe80::/10
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+# Generous headroom over what the Go runtime actually spawns (roughly
+# GOMAXPROCS plus a handful), while still capping a runaway.
+TasksMax=128
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

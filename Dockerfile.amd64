@@ -1,8 +1,0 @@
-FROM alpine:latest
-
-COPY hal-amd64 /hal
-COPY frontend /frontend
-
-VOLUME /config
-ENTRYPOINT ["/hal"]
-CMD ["-config", "/config/hal.yaml"]
