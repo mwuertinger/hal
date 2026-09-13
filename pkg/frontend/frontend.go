@@ -56,13 +56,45 @@ var (
 )
 
 func init() {
-	// Go's built-in table has no entry for .woff2 and otherwise falls back to
-	// /etc/mime.types, which comes from a package (media-types) that need not be
-	// installed on the target. Register it so the fonts are not served as
-	// application/octet-stream on a minimal host.
-	if err := mime.AddExtensionType(".woff2", "font/woff2"); err != nil {
-		panic(err)
+	// A typo in an asset name only shows up when Execute aborts part-way through,
+	// which reaches the user as a blank page with a 200 and nothing but a log line
+	// to say so. Rendering both branches here turns that into a refusal to start.
+	for _, page := range []homePage{
+		{},
+		{Rooms: []frontendRoom{{Name: "room", Devices: []frontendDevice{{ID: "d", Name: "n"}}}}, Total: 1},
+	} {
+		if err := indexTemplate.Execute(io.Discard, &page); err != nil {
+			panic(err)
+		}
 	}
+}
+
+// contentTypes pins the media types HAL actually ships, rather than asking the
+// mime package for them.
+//
+// Go's builtin table has no entry for .woff2 or .txt, so it would fall back to
+// /etc/mime.types - a file from a package that need not be installed on the
+// target. Registering the missing types with mime.AddExtensionType is not a fix
+// either, because every package-level variable is initialised before any init()
+// runs, so the registration would land after buildAssets had already read the
+// table. Pinning them here has no ordering to get wrong.
+//
+// Getting this wrong is quiet but not harmless: an empty Content-Type is worse
+// than a missing one, because http.ServeContent treats it as already set and
+// skips sniffing, so the response goes out with no type at all.
+var contentTypes = map[string]string{
+	".css":   "text/css; charset=utf-8",
+	".js":    "text/javascript; charset=utf-8",
+	".svg":   "image/svg+xml",
+	".txt":   "text/plain; charset=utf-8",
+	".woff2": "font/woff2",
+}
+
+func contentTypeFor(ext string) string {
+	if typ, ok := contentTypes[ext]; ok {
+		return typ
+	}
+	return mime.TypeByExtension(ext)
 }
 
 // staticAsset is one embedded file as it is actually served.
@@ -111,6 +143,14 @@ func buildAssets() map[string]*staticAsset {
 		return paths[i] < paths[j]
 	})
 
+	for _, a := range paths {
+		for _, b := range paths {
+			if a != b && strings.HasPrefix(b, a) {
+				panic(fmt.Sprintf("static asset %q is a prefix of %q: rewriting url() references would corrupt the longer one", a, b))
+			}
+		}
+	}
+
 	out := make(map[string]*staticAsset, len(paths))
 	for _, p := range paths {
 		content := must(fs.ReadFile(staticFiles, p))
@@ -118,13 +158,24 @@ func buildAssets() map[string]*staticAsset {
 			content = rewriteAssetRefs(content, out)
 		}
 
+		// Only stylesheets get their references rewritten, so anything else that
+		// names an asset would silently keep an unhashed URL and 404.
+		if path.Ext(p) != ".css" && bytes.Contains(content, []byte("/static/")) {
+			panic(fmt.Sprintf("static asset %q references /static/ but is not a stylesheet, so its URLs are never rewritten", p))
+		}
+
 		sum := sha256.Sum256(content)
 		hash := hex.EncodeToString(sum[:])[:16]
 		ext := path.Ext(p)
 
+		contentType := contentTypeFor(ext)
+		if contentType == "" {
+			panic(fmt.Sprintf("no content type for %q; add its extension to contentTypes", p))
+		}
+
 		out[p] = &staticAsset{
 			publicPath:  "/static/" + strings.TrimSuffix(p, ext) + "." + hash + ext,
-			contentType: mime.TypeByExtension(ext),
+			contentType: contentType,
 			content:     content,
 			etag:        `"` + hash + `"`,
 		}
@@ -136,8 +187,17 @@ func buildAssets() map[string]*staticAsset {
 // the assets it names, so a font is cache-busted by the same mechanism as the
 // stylesheet that loads it.
 func rewriteAssetRefs(content []byte, built map[string]*staticAsset) []byte {
-	for logical, a := range built {
-		content = bytes.ReplaceAll(content, []byte("/static/"+logical), []byte(a.publicPath))
+	logicals := make([]string, 0, len(built))
+	for logical := range built {
+		logicals = append(logicals, logical)
+	}
+	// Longest first, so a path that is a prefix of another cannot be substituted
+	// inside it. buildAssets rejects that case outright; this keeps the rewrite
+	// order-independent regardless.
+	sort.Slice(logicals, func(i, j int) bool { return len(logicals[i]) > len(logicals[j]) })
+
+	for _, logical := range logicals {
+		content = bytes.ReplaceAll(content, []byte("/static/"+logical), []byte(built[logical].publicPath))
 	}
 	return content
 }

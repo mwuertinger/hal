@@ -76,11 +76,16 @@
 
     var REQUEST_TIMEOUT = 10000;
 
-    // fetchWithTimeout bounds a request the way the server cannot. A phone that
-    // walks out of WiFi mid-request leaves the socket open with nothing coming
-    // back, and without this the promise never settles: the switch stays pending
-    // and the device's chain stops accepting taps.
-    function fetchWithTimeout(url, options) {
+    // request bounds a call the way the server cannot. A phone that walks out of
+    // WiFi mid-request leaves the socket open with nothing coming back, and
+    // without this the promise never settles: the switch stays pending and that
+    // device's queue stops accepting taps.
+    //
+    // consume reads the body, and is called inside the timeout rather than after
+    // it, because fetch() resolves as soon as the headers arrive - clearing the
+    // timer there would leave the body read unbounded, which is the same stall
+    // one step later.
+    function request(url, options, consume) {
         var abort = new AbortController();
         var timer = setTimeout(function () {
             abort.abort();
@@ -89,9 +94,20 @@
         options = options || {};
         options.signal = abort.signal;
 
-        return fetch(url, options).finally(function () {
+        return fetch(url, options).then(function (response) {
+            if (!response.ok) {
+                throw new Error("HTTP " + response.status);
+            }
+            return consume(response);
+        }).finally(function () {
             clearTimeout(timer);
         });
+    }
+
+    // An aborted request surfaces as "signal is aborted without reason", which
+    // says nothing useful to someone reading the activity log.
+    function describe(err) {
+        return err && err.name === "AbortError" ? "timed out" : err.message;
     }
 
     // --- Switching ---------------------------------------------------------
@@ -117,9 +133,18 @@
     // when the last one settles rather than when the newest token happens to win.
     var queued = Object.create(null);
 
+    // Per device, what the current run of overlapping taps started from. See the
+    // change handler.
+    var burst = Object.create(null);
+
     function supersede(id) {
         delete inFlight[id];
         epoch[id] = (epoch[id] || 0) + 1;
+        if (burst[id]) {
+            // Something authoritative arrived mid-burst; unwinding to where the
+            // burst started would now discard a newer fact than any of it.
+            burst[id].superseded = true;
+        }
     }
 
     document.addEventListener("change", function (event) {
@@ -133,15 +158,26 @@
         var target = input.checked;
         var token = {};
 
-        // Kept so the revert below can put it back. Bumping at tap time is what
-        // stops an in-flight resync from painting over the optimistic state, but
-        // if the tap turns out to have failed then nothing was learned, and
-        // leaving the epoch raised would disqualify this device from the very
-        // resync that would have corrected it.
-        var epochBefore = epoch[id] || 0;
+        // A burst is every tap on one device that overlaps in flight. Bumping the
+        // epoch per tap is what stops an in-flight resync painting over the
+        // optimistic state, but a tap that failed taught us nothing, and leaving
+        // the epoch raised would disqualify the device from the very resync that
+        // would have corrected it. Undoing only the newest tap is not enough:
+        // with two failed taps the first one's bump would survive. So the burst
+        // as a whole records where it started and unwinds to there if none of it
+        // ever succeeded.
+        if (!queued[id]) {
+            burst[id] = {
+                epoch: epoch[id] || 0,
+                state: row.classList.contains("is-on"),
+                succeeded: false,
+                superseded: false,
+                failed: false
+            };
+        }
 
         inFlight[id] = token;
-        epoch[id] = epochBefore + 1;
+        epoch[id] = (epoch[id] || 0) + 1;
         queued[id] = (queued[id] || 0) + 1;
 
         // Show the new state right away, then correct it if the request fails:
@@ -150,39 +186,50 @@
         row.classList.add("is-pending");
 
         function send() {
-            return fetchWithTimeout("/api/" + encodeURIComponent(id), {
+            return request("/api/" + encodeURIComponent(id), {
                 method: "PUT",
                 body: target ? "true" : "false"
-            }).then(function (response) {
-                if (!response.ok) {
-                    throw new Error("HTTP " + response.status);
-                }
-                // The reply is empty, but leaving it unread makes the browser
-                // cancel the body stream and log an aborted request every time.
+            // The reply is empty, but leaving it unread makes the browser cancel
+            // the body stream and log an aborted request every time.
+            }, function (response) {
                 return response.text();
+            }).then(function () {
+                if (burst[id]) {
+                    burst[id].succeeded = true;
+                    burst[id].failed = false;
+                    burst[id].state = target;
+                }
             }).catch(function (err) {
                 log(row.querySelector(".device-name").textContent +
-                    ": switch failed, " + err.message);
-
-                // Only undo our own optimistic paint. If something already told us
-                // the real state, or the user has since clicked again, that is the
-                // truth now and this stale response must not overwrite it.
-                if (inFlight[id] !== token) {
-                    return;
+                    ": switch failed, " + describe(err));
+                if (burst[id]) {
+                    burst[id].failed = true;
                 }
-                input.checked = !target;
-                paint(row, !target);
-
-                // Still the newest token, so nothing has bumped the epoch since
-                // this tap did; putting it back cannot discard anyone else's fact.
-                epoch[id] = epochBefore;
             }).finally(function () {
                 if (inFlight[id] === token) {
                     delete inFlight[id];
                 }
+
                 queued[id]--;
-                if (queued[id] === 0) {
-                    row.classList.remove("is-pending");
+                if (queued[id] > 0) {
+                    return;
+                }
+
+                row.classList.remove("is-pending");
+
+                var b = burst[id];
+                delete burst[id];
+                if (!b || b.superseded || !b.failed) {
+                    return;
+                }
+
+                // The last request of the burst failed, so the page is showing an
+                // optimistic state that never happened. Fall back to the last one
+                // that did - the start of the burst, or the last tap that landed.
+                input.checked = b.state;
+                paint(row, b.state);
+                if (!b.succeeded) {
+                    epoch[id] = b.epoch;
                 }
             });
         }
@@ -278,10 +325,7 @@
         var seq = ++resyncSeq;
         var seen = Object.assign(Object.create(null), epoch);
 
-        return fetchWithTimeout("/api/state").then(function (response) {
-            if (!response.ok) {
-                throw new Error("HTTP " + response.status);
-            }
+        return request("/api/state", null, function (response) {
             return response.json();
         }).then(function (states) {
             // A newer resync is already in flight and owns the outcome, status
@@ -298,7 +342,7 @@
             if (seq !== resyncSeq) {
                 return;
             }
-            log("could not read device state: " + err.message);
+            log("could not read device state: " + describe(err));
             if (!socketOpen) {
                 return;
             }
