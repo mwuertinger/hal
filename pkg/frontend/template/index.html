@@ -36,6 +36,11 @@
 </header>
 
 <main class="wrap">
+    <noscript>
+        <p class="noscript">The switches need JavaScript: without it this page can show the state
+            of a device but not change it.</p>
+    </noscript>
+
     <div class="overview">
         <h1>Devices</h1>
         <span class="overview-count" id="overview">{{ if .Total }}<b>{{ .OnCount }}</b> of {{ .Total }} on{{ end }}</span>
@@ -43,14 +48,17 @@
 
     {{ if .Rooms }}
     <div class="rooms">
-        {{ range .Rooms }}
-        <section class="room{{ if .AnyOn }} has-on{{ end }}">
+        {{ range $i, $room := .Rooms }}
+        <section class="room{{ if $room.AnyOn }} has-on{{ end }}" aria-labelledby="room-{{ $i }}">
             <div class="room-head">
-                <h2>{{ .Name }}</h2>
-                <span class="room-count">{{ .OnCount }}/{{ len .Devices }} on</span>
+                <!-- The heading id is the index, not the name: a location is free text
+                     from the config file, and an id with a space in it silently breaks
+                     the aria-labelledby reference. -->
+                <h2 id="room-{{ $i }}">{{ $room.Name }}</h2>
+                <span class="room-count">{{ $room.OnCount }}/{{ len $room.Devices }} on</span>
             </div>
             <ul class="devices" role="list">
-                {{ range .Devices }}
+                {{ range $room.Devices }}
                 <li class="device{{ if .State }} is-on{{ end }}" data-device="{{ .ID }}">
                     <span class="device-icon">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -60,12 +68,14 @@
                         </svg>
                     </span>
                     <span class="device-body">
-                        <span class="device-name">{{ .Name }}</span>
+                        <span class="device-name" title="{{ .Name }}">{{ .Name }}</span>
                         <span class="device-state">{{ if .State }}On{{ else }}Off{{ end }}</span>
                     </span>
                     <label class="switch">
-                        <input type="checkbox" hal-device="{{ .ID }}" aria-label="{{ .Name }}"
-                               {{ if .State }}checked{{ end }}>
+                        <!-- Disabled until hal.js enables it: a page whose script failed would
+                             otherwise animate a switch that reaches nobody, and look operable. -->
+                        <input type="checkbox" role="switch" data-device="{{ .ID }}" aria-label="{{ .Name }}"
+                               disabled {{ if .State }}checked{{ end }}>
                         <span class="slider"></span>
                     </label>
                 </li>
@@ -80,6 +90,10 @@
         <p>Add entries under <code>devices:</code> in hal.yaml and restart the service.</p>
     </div>
     {{ end }}
+
+    <!-- State changes HAL is told about, rather than ones the user made here, are
+         written in so a screen reader announces them. -->
+    <div id="announce" class="visually-hidden" role="status"></div>
 
     <details class="log">
         <summary>Activity log</summary>

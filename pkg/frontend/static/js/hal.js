@@ -20,7 +20,7 @@
         // flapping connection would otherwise re-announce "Reconnecting" on each
         // backoff step. Only touch the text when it actually changes.
         var textEl = statusEl.querySelector(".status-text");
-        if (textEl.textContent !== text) {
+        if (textEl && textEl.textContent !== text) {
             textEl.textContent = text;
         }
     }
@@ -61,14 +61,39 @@
             });
 
             room.classList.toggle("has-on", roomOn > 0);
-            room.querySelector(".room-count").textContent = roomOn + "/" + rooms.length + " on";
+            var count = room.querySelector(".room-count");
+            if (count) {
+                count.textContent = roomOn + "/" + rooms.length + " on";
+            }
 
             total += rooms.length;
             on += roomOn;
         });
 
-        if (overviewEl) {
-            overviewEl.innerHTML = total === 0 ? "" : "<b>" + on + "</b> of " + total + " on";
+        if (!overviewEl) {
+            return;
+        }
+        // Built from nodes rather than from innerHTML. Only integers reach it
+        // today, but it is the one place in this file that would interpret
+        // markup, and a device name is one refactor away from arriving here.
+        overviewEl.textContent = "";
+        if (total === 0) {
+            return;
+        }
+        var strong = document.createElement("b");
+        strong.textContent = String(on);
+        overviewEl.appendChild(strong);
+        overviewEl.appendChild(document.createTextNode(" of " + total + " on"));
+    }
+
+    // announce writes into the visually hidden live region, so a state change
+    // the user did not cause - another browser, the physical button, a resync -
+    // is spoken rather than only shown.
+    var announceEl = document.getElementById("announce");
+
+    function announce(text) {
+        if (announceEl) {
+            announceEl.textContent = text;
         }
     }
 
@@ -141,7 +166,15 @@
     var burst = Object.create(null);
 
     function supersede(id, state) {
-        delete inFlight[id];
+        // Only drop the guard when nothing is outstanding. An event that lands
+        // mid-request is not necessarily newer than the request: Tasmota
+        // publishes tele/<id>/STATE on a timer, and a frame sent just before
+        // the command reached the lamp restates the state we are switching away
+        // from. Dropping the guard there let a later resync write freely to a
+        // device that still had a PUT in flight.
+        if (!queued[id]) {
+            delete inFlight[id];
+        }
         epoch[id] = (epoch[id] || 0) + 1;
         if (burst[id]) {
             // An authoritative event is the newest thing known about this device,
@@ -156,12 +189,12 @@
 
     document.addEventListener("change", function (event) {
         var input = event.target;
-        if (!input.matches || !input.matches("input[hal-device]")) {
+        if (!input.matches || !input.matches("input[data-device]")) {
             return;
         }
 
         var row = input.closest(".device");
-        var id = input.getAttribute("hal-device");
+        var id = input.dataset.device;
         var target = input.checked;
         var token = {};
 
@@ -200,14 +233,24 @@
             }, function (response) {
                 return response.text();
             }).then(function () {
+                // A request that landed is new knowledge about the device, so
+                // it moves the epoch on, exactly as an event does. Without
+                // this, a resync whose snapshot was taken after the tap but
+                // answered before the lamp echoed - which is every resync
+                // issued during an MQTT round trip - passed both guards in
+                // applyStates and painted the switch back to where it started,
+                // while the status pill said "Live".
+                epoch[id] = (epoch[id] || 0) + 1;
                 if (burst[id]) {
                     burst[id].succeeded = true;
                     burst[id].failed = false;
                     burst[id].state = target;
                 }
             }).catch(function (err) {
-                log(row.querySelector(".device-name").textContent +
-                    ": switch failed, " + describe(err));
+                var failure = row.querySelector(".device-name").textContent +
+                    ": switch failed, " + describe(err);
+                log(failure);
+                announce(failure);
                 if (burst[id]) {
                     burst[id].failed = true;
                 }
@@ -234,6 +277,13 @@
                 // that did - the start of the burst, or the last tap that landed.
                 input.checked = b.state;
                 paint(row, b.state);
+                // The switch snapping back on its own is otherwise the only
+                // sign of a failure, and the reason for it is written to a log
+                // panel that is closed by default.
+                row.classList.add("is-failed");
+                setTimeout(function () {
+                    row.classList.remove("is-failed");
+                }, 2000);
                 if (!b.succeeded) {
                     epoch[id] = b.epoch;
                 }
@@ -315,7 +365,7 @@
                 return;
             }
             var state = !!states[id];
-            row.querySelector("input[hal-device]").checked = state;
+            row.querySelector("input[data-device]").checked = state;
             paint(row, state);
         });
     }
@@ -340,6 +390,7 @@
                 return;
             }
             applyStates(states, seen);
+            lastContact = Date.now();
             resyncRetry = 0;
             if (socketOpen) {
                 setStatus("live", "Live");
@@ -362,14 +413,53 @@
     // --- Websocket ---------------------------------------------------------
 
     var retry = 0;
+    var socket = null;
+
+    // lastContact is when the socket last proved it was alive. A socket that
+    // dies without a close frame - a phone in a pocket, a router that dropped
+    // the NAT entry - leaves onclose unfired and the page claiming "Live" over
+    // rows that stopped updating, so returning to the tab checks the age of
+    // this rather than trusting socketOpen.
+    var lastContact = 0;
+    var STALE_AFTER = 60000;
+
+    function reconnectLater() {
+        // Back off up to 30s so a server that stays down is not hammered.
+        var delay = Math.min(1000 * Math.pow(2, retry++), 30000);
+        setStatus("down", "Reconnecting");
+        setTimeout(connect, delay);
+    }
 
     function connect() {
         var scheme = document.location.protocol === "https:" ? "wss://" : "ws://";
-        var socket = new WebSocket(scheme + document.location.host + "/api/ws");
+        try {
+            socket = new WebSocket(scheme + document.location.host + "/api/ws");
+        } catch (err) {
+            // new WebSocket() throws rather than failing asynchronously for a
+            // malformed or blocked URL. Without this the reconnect chain, which
+            // is only ever re-entered from onclose, would end here for good.
+            socket = null;
+            log("could not open websocket: " + err.message);
+            reconnectLater();
+            return;
+        }
+
+        var self = socket;
 
         socket.onopen = function () {
-            retry = 0;
             socketOpen = true;
+            lastContact = Date.now();
+
+            // Only reset the backoff once the connection has proved it can
+            // stay up. Resetting it on open meant a server that accepts and
+            // immediately drops - which this one does to a client that falls
+            // 64 events behind - was reconnected once a second forever, with
+            // the exponential backoff never engaging.
+            setTimeout(function () {
+                if (socket === self && socketOpen) {
+                    retry = 0;
+                }
+            }, 10000);
 
             // Not "Live" yet: the socket only carries changes from this moment on,
             // so the rows are unverified until the resync below comes back.
@@ -388,22 +478,37 @@
                 return;
             }
 
-            var state = !!(event.Payload && event.Payload.State);
+            if (!event.Payload || typeof event.Payload.State !== "boolean") {
+                // Not a switch event. Coercing an unknown payload with !! would
+                // paint the row off, which for a sensor reading is a lie.
+                log("ignoring event for " + event.DeviceId + " with an unknown payload");
+                return;
+            }
+
+            var state = event.Payload.State;
+            lastContact = Date.now();
             supersede(event.DeviceId, state);
 
             var row = rowFor(event.DeviceId);
-            if (row) {
-                row.querySelector("input[hal-device]").checked = state;
+            // Not while a request is outstanding: the optimistic state is the
+            // newer fact until its own echo arrives, and this event may predate
+            // the command. The request's own success or failure repaints.
+            if (row && !queued[event.DeviceId]) {
+                row.querySelector("input[data-device]").checked = state;
                 paint(row, state);
             }
 
             var name = row ? row.querySelector(".device-name").textContent : event.DeviceId;
+            announce(name + " " + (state ? "on" : "off"));
             // "->" rather than an arrow glyph: U+2192 is outside both Inter
             // subsets, so it would render from the fallback stack on every line.
             log(name + " -> " + (state ? "on" : "off"), event.Timestamp);
         };
 
         socket.onclose = function () {
+            if (socket === self) {
+                socket = null;
+            }
             socketOpen = false;
             // Retrying /api/state while the socket is down is pointless; the next
             // onopen starts a fresh one.
@@ -411,11 +516,8 @@
 
             // The server restarts on config changes and the phone drops the
             // socket whenever it sleeps, so reconnecting is the normal path,
-            // not an error path. Back off up to 30s so a server that stays
-            // down does not get hammered.
-            var delay = Math.min(1000 * Math.pow(2, retry++), 30000);
-            setStatus("down", "Reconnecting");
-            setTimeout(connect, delay);
+            // not an error path.
+            reconnectLater();
         };
 
         socket.onerror = function () {
@@ -423,7 +525,41 @@
         };
     }
 
+    // Coming back to the page is the moment the rows are most likely to be
+    // stale, and the moment a half-open socket is most likely to be discovered.
+    // A short absence only needs the state refetched; a long one gets a fresh
+    // socket, because the old one may be talking to nobody.
+    function recheck() {
+        if (!socketOpen) {
+            return;
+        }
+        if (Date.now() - lastContact > STALE_AFTER && socket) {
+            socket.close();
+            return;
+        }
+        resync();
+    }
+
+    document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "visible") {
+            recheck();
+        }
+    });
+    window.addEventListener("online", recheck);
+    window.addEventListener("pageshow", recheck);
+
+    // The switches render disabled, so that a page whose script never ran
+    // cannot animate a toggle that talks to nobody. This is the last statement
+    // of initialisation for that reason: anything above it that throws leaves
+    // them disabled, which is honest.
+    function enableSwitches() {
+        document.querySelectorAll("input[data-device]").forEach(function (input) {
+            input.disabled = false;
+        });
+    }
+
     refreshCounts();
     setStatus("connecting", "Connecting");
     connect();
+    enableSwitches();
 })();
