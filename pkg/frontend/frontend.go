@@ -1,9 +1,11 @@
 package frontend
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -14,6 +16,7 @@ import (
 	"net/http"
 	"path"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,9 +47,12 @@ var (
 	shutdown chan interface{}
 	wg       sync.WaitGroup
 
-	indexTemplate = template.Must(template.ParseFS(templateFS, "template/index.html"))
-	staticFiles   = must(fs.Sub(staticFS, "static"))
-	staticETags   = buildStaticETags()
+	staticFiles = must(fs.Sub(staticFS, "static"))
+	assets      = buildAssets()
+
+	indexTemplate = template.Must(template.New("index.html").
+			Funcs(template.FuncMap{"asset": assetURL}).
+			ParseFS(templateFS, "template/index.html"))
 )
 
 func init() {
@@ -59,47 +65,115 @@ func init() {
 	}
 }
 
-// buildStaticETags derives an ETag from the content of every embedded static asset. embed.FS
-// reports a zero ModTime, which makes http.FileServer omit Last-Modified and therefore skip
-// conditional requests altogether; without a validator of our own every page load would
-// re-transfer all assets. Hashing the content rather than stamping a build time also keeps the
-// validator honest across upgrades: the ETag changes exactly when the bytes do.
-func buildStaticETags() map[string]string {
-	etags := make(map[string]string)
+// staticAsset is one embedded file as it is actually served.
+type staticAsset struct {
+	// publicPath contains a hash of the content, e.g. /static/css/hal.1a2b3c.css.
+	publicPath  string
+	contentType string
+	content     []byte
+	etag        string
+}
+
+// buildAssets gives every static file a URL derived from its content.
+//
+// Validators alone are not enough. Before these assets were embedded they were
+// served by http.FileServer(http.Dir(...)), which sends Last-Modified and no
+// Cache-Control, and a response like that is heuristically cacheable: RFC 9111
+// lets a client treat it as fresh for a fraction of its age - Firefox uses 10%,
+// so a file with a year-old mtime stays fresh for over a month - and for that
+// whole window the client never revalidates, so it never sees a new ETag either.
+// A browser that cached hal.css from the old deployment therefore went on
+// rendering the old stylesheet over the new markup.
+//
+// Hashing the URL fixes both directions: a new build is a URL no cache has ever
+// seen, so a poisoned cache heals on its own, and an unchanged build keeps its
+// URL, so the response can be marked immutable and skip revalidation entirely.
+func buildAssets() map[string]*staticAsset {
+	var paths []string
 	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		content, err := fs.ReadFile(staticFiles, p)
-		if err != nil {
-			return err
-		}
-		etags["/"+p] = fmt.Sprintf(`"%x"`, sha256.Sum256(content))
+		paths = append(paths, p)
 		return nil
 	})
 	if err != nil {
 		panic(err)
 	}
-	return etags
+
+	// Stylesheets last: they refer to other assets by URL, so those must already
+	// have been hashed before a stylesheet's own content is final.
+	sort.Slice(paths, func(i, j int) bool {
+		iCSS, jCSS := path.Ext(paths[i]) == ".css", path.Ext(paths[j]) == ".css"
+		if iCSS != jCSS {
+			return jCSS
+		}
+		return paths[i] < paths[j]
+	})
+
+	out := make(map[string]*staticAsset, len(paths))
+	for _, p := range paths {
+		content := must(fs.ReadFile(staticFiles, p))
+		if path.Ext(p) == ".css" {
+			content = rewriteAssetRefs(content, out)
+		}
+
+		sum := sha256.Sum256(content)
+		hash := hex.EncodeToString(sum[:])[:16]
+		ext := path.Ext(p)
+
+		out[p] = &staticAsset{
+			publicPath:  "/static/" + strings.TrimSuffix(p, ext) + "." + hash + ext,
+			contentType: mime.TypeByExtension(ext),
+			content:     content,
+			etag:        `"` + hash + `"`,
+		}
+	}
+	return out
 }
 
-// staticHandler serves the embedded static assets. Each response carries a content-derived ETag
-// so that http.ServeContent can answer a revalidating browser with 304 Not Modified. The assets
-// are served under fixed, unversioned URLs, so they are marked no-cache (cache, but revalidate)
-// rather than immutable: a new build must not be shadowed by a stale copy of hal.css.
+// rewriteAssetRefs points a stylesheet's url() references at the hashed paths of
+// the assets it names, so a font is cache-busted by the same mechanism as the
+// stylesheet that loads it.
+func rewriteAssetRefs(content []byte, built map[string]*staticAsset) []byte {
+	for logical, a := range built {
+		content = bytes.ReplaceAll(content, []byte("/static/"+logical), []byte(a.publicPath))
+	}
+	return content
+}
+
+// assetURL is the template's "asset" function: it maps a path inside static/ to
+// the hashed URL that path is served at.
+func assetURL(logical string) (string, error) {
+	a, ok := assets[logical]
+	if !ok {
+		return "", fmt.Errorf("unknown static asset %q", logical)
+	}
+	return a.publicPath, nil
+}
+
+// staticHandler serves the embedded assets from their content-hashed URLs. Because
+// the URL changes whenever the bytes do, a cached copy can never be the wrong one -
+// which is what makes immutable safe, and immutable is what spares a phone a
+// revalidation round trip per asset on every page load.
 func staticHandler() http.Handler {
-	fileServer := http.FileServer(http.FS(staticFiles))
+	byPath := make(map[string]*staticAsset, len(assets))
+	for _, a := range assets {
+		byPath[a.publicPath] = a
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		etag, isFile := staticETags[path.Clean("/"+r.URL.Path)]
-		if !isFile {
-			// Every path that is not one of the embedded files is either a
-			// directory, which http.FileServer would happily index, or absent.
+		// StripPrefix has already removed "/static/", trailing slash included.
+		a, ok := byPath[path.Clean("/static/"+r.URL.Path)]
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("ETag", etag)
-		w.Header().Set("Cache-Control", "public, no-cache")
-		fileServer.ServeHTTP(w, r)
+
+		w.Header().Set("Content-Type", a.contentType)
+		w.Header().Set("ETag", a.etag)
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(a.content))
 	})
 }
 
@@ -261,6 +335,12 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		page.Total += len(room.Devices)
 	}
 
+	// The page carries live device state, so it must never be cached - and a
+	// response with neither Cache-Control nor Last-Modified cannot be cached
+	// heuristically either, which is the only reason the markup stayed fresh
+	// while the stylesheet went stale.
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(200)
 	err := indexTemplate.Execute(w, &page)
 

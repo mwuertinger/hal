@@ -7,7 +7,7 @@
    block on the font until the browser gave up on it.
    --------------------------------------------------------------------------- */
 
-/* Inter, SIL Open Font License 1.1 - see /static/fonts/LICENSE.txt. These are
+/* Inter, SIL Open Font License 1.1 - LICENSE.txt sits next to the files. These are
    Google Fonts' own variable-weight subsets, downloaded verbatim; the
    unicode-range split is theirs too, so a page of German device names only ever
    pulls the 47 KB latin file and leaves latin-ext on disk. Refresh both from
