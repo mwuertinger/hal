@@ -4,6 +4,11 @@ Documentation=https://github.com/mwuertinger/hal
 After=network-online.target
 Wants=network-online.target
 
+# A broker that is down for hours is a normal condition for this service (see
+# Restart= below), so disable the start rate limit rather than let repeated
+# restarts leave the unit dead.
+StartLimitIntervalSec=0
+
 [Service]
 Type=exec
 ExecStart=/usr/local/bin/hal -config /etc/hal/hal.yaml
@@ -24,9 +29,21 @@ SyslogIdentifier=hal
 # talks TCP. Empty CapabilityBoundingSet= drops every capability from the
 # bounding set, so nothing can be regained.
 #
-# If you change listen-address in hal.yaml to a port below 1024, add:
-#   AmbientCapabilities=CAP_NET_BIND_SERVICE
-#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Listening on a port below 1024 is NOT just a matter of granting
+# CAP_NET_BIND_SERVICE. A capability held inside the private user namespace
+# only authorizes operations on objects owned by that namespace, and bind() is
+# checked against the host's network namespace, so the bind still fails with
+# EPERM. Prefer keeping an unprivileged port behind a reverse proxy, or lower
+# the threshold system-wide with
+#   sysctl net.ipv4.ip_unprivileged_port_start=80
+# If you must bind directly, all four of these are required together: remove
+# PrivateUsers=yes, add CAP_NET_BIND_SERVICE to both AmbientCapabilities= and
+# CapabilityBoundingSet=, and update SocketBindAllow= below.
+#
+# PrivateUsers=yes is also the one directive here with a hard kernel
+# dependency (CONFIG_USER_NS plus a non-zero user.max_user_namespaces). It
+# fails loudly at namespace setup if unavailable; drop it if you are on an old
+# or custom kernel.
 # ---------------------------------------------------------------------------
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -61,6 +78,12 @@ NoExecPaths=/
 ExecPaths=/usr/local/bin/hal
 MemoryDenyWriteExecute=yes
 
+# Only the kernel API filesystems plus the one holding / and /etc/hal. ext4 is
+# the Raspberry Pi OS default; CHANGE IT if your root filesystem is btrfs, xfs
+# or f2fs, or drop this line if unsure. Needs systemd >= 250 and BPF LSM; where
+# unsupported systemd logs a warning and carries on.
+RestrictFileSystems=@basic-api ext4
+
 # ---------------------------------------------------------------------------
 # Kernel, devices and host
 # ---------------------------------------------------------------------------
@@ -81,31 +104,38 @@ RemoveIPC=yes
 # ---------------------------------------------------------------------------
 # System calls
 #
-# @resources is deliberately NOT denied: the Go runtime raises RLIMIT_NOFILE
-# via setrlimit() at startup, and blocking it kills the process with SIGSYS.
+# @privileged and @resources are the only two groups @system-service actually
+# pulls in, so subtracting anything else would be a no-op. @resources is
+# returned as EPERM rather than SIGSYS purely as a belt-and-braces measure: Go
+# only calls setrlimit() when the soft and hard RLIMIT_NOFILE differ (they do
+# not, LimitNOFILE= below sets a single value) and discards its return value
+# either way, but EPERM keeps that true if anyone later sets a soft:hard pair.
 # ---------------------------------------------------------------------------
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @obsolete @mount @swap @reboot @cpu-emulation @module @raw-io @debug
+SystemCallFilter=~@privileged @resources:EPERM
 
 # ---------------------------------------------------------------------------
 # Network
 #
-# AF_NETLINK is required by the Go runtime for its route/interface lookups.
-# AF_UNIX is not listed because the static build uses the pure-Go resolver;
-# add it if you ever build HAL with cgo (NSS/nscd needs a unix socket).
+# Netlink is only reached from net.Interfaces/InterfaceAddrs and the IPv6 zone
+# cache, none of which HAL uses; the zone cache degrades to a numeric zone id
+# anyway, so AF_NETLINK is not granted. AF_UNIX is not listed either because
+# the static build uses the pure-Go resolver and Type=exec needs no sd_notify
+# socket; add it if you ever build HAL with cgo (NSS/nscd needs a unix socket).
 # ---------------------------------------------------------------------------
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictAddressFamilies=AF_INET AF_INET6
 
 # HAL only ever listens on its one HTTP port; everything else is outbound.
 # This MUST match the port in hal.yaml's http.listen-address.
 SocketBindDeny=any
 SocketBindAllow=tcp:8080
 
-# Confine traffic to loopback and RFC1918/link-local, which covers a broker
-# and a DNS resolver on the LAN. If your MQTT broker or resolver lives outside
-# your local network, add its address here or this will silently fail to
-# connect.
+# Confine traffic to loopback and RFC1918/link-local, which covers a broker and
+# a DNS resolver on the LAN. The likeliest way this bites is DNS, not the
+# broker: a stock /etc/resolv.conf pointing at a public resolver such as
+# 1.1.1.1 or 8.8.8.8 is outside these ranges. The symptom is an unusual
+# "connect: permission denied" on startup — add the address here if so.
 IPAddressDeny=any
 IPAddressAllow=localhost
 IPAddressAllow=10.0.0.0/8
