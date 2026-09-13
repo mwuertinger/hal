@@ -462,10 +462,13 @@ input:focus-visible + .slider {
     box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--text);
 }
 
-/* Pending used to be cursor-only, which on a phone is nothing at all. */
+/* Pending used to be cursor-only, which on a phone is nothing at all. Not
+   opacity: fading the slider fades its border too, and that border is what
+   gives the control the 3:1 boundary it needs - a pending switch is still
+   focusable and tappable, so it does not get the disabled exemption. */
 .device.is-pending .slider {
     cursor: progress;
-    opacity: 0.6;
+    border-style: dashed;
 }
 
 .device.is-pending .device-state::after {

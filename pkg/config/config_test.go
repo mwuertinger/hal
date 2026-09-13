@@ -355,3 +355,17 @@ devices:
 		t.Errorf("Devices[0].Location = %q, want %q", c.Devices[0].Location, defaultLocation)
 	}
 }
+
+// TestNormaliseAllowedHosts: an untrimmed entry matches nothing, so every
+// request for that name is refused with 421 and no log line explains it.
+func TestNormaliseAllowedHosts(t *testing.T) {
+	c := valid()
+	c.Http.AllowedHosts = []string{" hal.example.com", "", "  ", "hal.example.org\t"}
+
+	normalise(c)
+
+	want := []string{"hal.example.com", "hal.example.org"}
+	if !reflect.DeepEqual(c.Http.AllowedHosts, want) {
+		t.Errorf("AllowedHosts = %q, want %q", c.Http.AllowedHosts, want)
+	}
+}

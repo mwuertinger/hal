@@ -332,7 +332,15 @@ func Start(httpConfig config.Http) error {
 // answers 405 with an Allow header. That last part is why /static/ names its
 // methods too - it used to serve the file body in reply to DELETE, and a
 // non-error response to an unsafe method makes a cache drop the entry that
-// content-addressed URLs exist to keep.
+// content-addressed URLs exist to keep. It does not close that off entirely:
+// path canonicalisation happens before method matching, so POST /static//x
+// still gets a 307 naming the asset in Location. A cache MUST invalidate on
+// the target URI and only MAY on Location, so this is much narrower than
+// answering with the file - and it behaved the same under the previous router.
+//
+// Canonicalisation also answers 307 where gorilla/mux answered 301. Browsers
+// normalise ".." and "//" before sending, so nothing reachable changed, and 307
+// preserves the method.
 func router() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", homeHandler)
@@ -375,7 +383,13 @@ func hostCheck(next http.Handler, allowed []string) http.Handler {
 // lanSuffixes are the domain suffixes reserved for, or conventionally used on,
 // local networks. A name under one of them cannot be registered publicly, so it
 // cannot be the vehicle for a rebinding attack.
-var lanSuffixes = []string{".local", ".lan", ".home", ".home.arpa", ".internal", ".localhost"}
+// .box is not a formality: 192.168.178.0/24 is the AVM Fritz!Box factory
+// default, and a Fritz!Box publishes every LAN host as <name>.fritz.box and
+// hands that out as the DHCP search domain, so it is a name someone in the
+// house may well have bookmarked.
+var lanSuffixes = []string{
+	".local", ".lan", ".home", ".home.arpa", ".internal", ".localhost", ".box", ".localdomain",
+}
 
 func hostIsLocal(host string, permitted map[string]bool) bool {
 	name := host
@@ -391,15 +405,16 @@ func hostIsLocal(host string, permitted map[string]bool) bool {
 	if permitted[name] {
 		return true
 	}
-	if name == "localhost" {
-		return true
-	}
 	// An IPv6 literal keeps its brackets when there is no port.
 	if net.ParseIP(strings.Trim(name, "[]")) != nil {
 		return true
 	}
 	if !strings.Contains(name, ".") {
-		// A single-label name is not resolvable on the public internet.
+		// A single label - "raspberrypi", "localhost" - is a name from the
+		// local network or the hosts file. It is not proof of anything (a
+		// search domain can make one resolve, and a few TLDs answer at their
+		// apex), but a rebinding attacker needs a name they control, and they
+		// cannot register a label in the victim's own search domain.
 		return true
 	}
 	for _, suffix := range lanSuffixes {
@@ -623,19 +638,21 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 	deviceId := r.PathValue("device")
 	dev := device.Get(deviceId)
 	if dev == nil {
-		log.Printf("device not found: %s", deviceId)
+		log.Printf("device not found: %q", deviceId)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	switchDev, success := dev.(device.Switch)
 	if !success {
-		log.Printf("device %s is not a switch", deviceId)
+		log.Printf("device %q is not a switch", deviceId)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Device: %s, Target state: %v", deviceId, status)
+	// %q: the id is a decoded path segment, so an unquoted one can carry a
+	// newline and forge a journal line.
+	log.Printf("Device: %q, Target state: %v", deviceId, status)
 	if err = switchDev.Switch(status); err != nil {
 		log.Printf("send command failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -665,13 +682,15 @@ const (
 	// exhaust the Pi's memory.
 	wsReadLimit = 512
 
-	// wsPingInterval and wsPongTimeout detect a connection that died without a
-	// close frame - a phone that walked out of wifi, a router that dropped the
-	// NAT entry. Without them the only backstop is TCP keepalive, and the
-	// browser meanwhile keeps showing state it is no longer being sent.
-	wsPingInterval = 30 * time.Second
-	wsPongTimeout  = 90 * time.Second
+	// wsPongTimeout is how long a client may go without answering a ping.
+	wsPongTimeout = 90 * time.Second
 )
+
+// wsPingInterval detects a connection that died without a close frame - a phone
+// that walked out of wifi, a router that dropped the NAT entry. Without it the
+// only backstop is TCP keepalive, and the browser meanwhile keeps showing state
+// it is no longer being sent.
+const wsPingInterval = 30 * time.Second
 
 // upgrader replaces the package-level websocket.Upgrade, which is deprecated
 // and, more to the point, sets CheckOrigin to accept everything. Websockets are
@@ -680,6 +699,55 @@ const (
 // every lamp transition in the house, timestamped. The zero value's CheckOrigin
 // is a same-origin check, which is what this needs.
 var upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
+
+// writePump is the one goroutine allowed to write to a client's connection:
+// events from its queue, and a ping every pingInterval. It ends when the queue
+// is closed or a write fails, and closes the connection on its way out.
+//
+// pingInterval is a parameter rather than a constant read here so that a test
+// can drive it faster without writing to package state that live connections
+// are reading.
+func writePump(client *wsClient, pingInterval time.Duration) {
+	conn := client.conn
+
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case event, ok := <-client.send:
+			if !ok {
+				dropClient(client)
+				// Nothing else closes the hijacked connection. Leaving it open
+				// leaks a file descriptor per disconnect - against
+				// LimitNOFILE=1024 in hal.service - and strands a client that
+				// closed cleanly in CLOSING, still waiting for the server half
+				// of the handshake, so its onclose never fires and it never
+				// reconnects. A client dropped for falling behind reaches this
+				// with its connection still perfectly healthy, so nothing else
+				// would ever close it.
+				conn.Close()
+				return
+			}
+			if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+				log.Printf("WS %v: SetWriteDeadline: %v", conn.RemoteAddr(), err)
+			}
+			if err := conn.WriteJSON(event); err != nil {
+				log.Printf("WS %v: WriteJSON: %v, dropping", conn.RemoteAddr(), err)
+				dropClient(client)
+				conn.Close()
+				return
+			}
+		case <-ticker.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
+				log.Printf("WS %v: ping: %v, dropping", conn.RemoteAddr(), err)
+				dropClient(client)
+				conn.Close()
+				return
+			}
+		}
+	}
+}
 
 // wsClient is one browser: its connection plus the queue feeding it. Only the
 // client's own writer goroutine touches the connection for writing, which is
@@ -738,8 +806,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Register before starting either goroutine. The other order leaves a window
 	// where a connection that dies immediately is not yet in the map, so the
-	// reader's dropClient finds nothing to do, the queue is never closed, and the
-	// writer parks on the range for the life of the process. A broadcast landing
+	// reader's dropClient finds nothing to do, the queue is never closed, and
+	// the writer holds the connection until its next ping fails. A broadcast landing
 	// in this window instead either buffers or takes the drop path, and a writer
 	// that then starts on an already-closed queue drains it and exits.
 	if !addClient(client) {
@@ -756,43 +824,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	// Writer. Ends when the queue is closed, or when a write fails - a stalled
 	// client hits the deadline rather than blocking here forever. It also owns
 	// the ping ticker, because gorilla allows only one writer at a time.
-	go func() {
-		ticker := time.NewTicker(wsPingInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case event, ok := <-client.send:
-				if !ok {
-					dropClient(client)
-					conn.Close()
-					return
-				}
-				if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
-					log.Printf("WS %v: SetWriteDeadline: %v", conn.RemoteAddr(), err)
-				}
-				if err := conn.WriteJSON(event); err != nil {
-					log.Printf("WS %v: WriteJSON: %v, dropping", conn.RemoteAddr(), err)
-					dropClient(client)
-					// Nothing else closes the hijacked connection. Leaving it
-					// open leaks a file descriptor per disconnect - against
-					// LimitNOFILE=1024 in hal.service - and strands a client
-					// that closed cleanly in CLOSING, still waiting for the
-					// server half of the handshake, so its onclose never fires
-					// and it never reconnects.
-					conn.Close()
-					return
-				}
-			case <-ticker.C:
-				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
-					log.Printf("WS %v: ping: %v, dropping", conn.RemoteAddr(), err)
-					dropClient(client)
-					conn.Close()
-					return
-				}
-			}
-		}
-	}()
+	go writePump(client, wsPingInterval)
 
 	// Reader. The page never sends anything, so this exists to notice the
 	// connection going away - either by a read error, or by the pong for one of

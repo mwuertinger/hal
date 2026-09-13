@@ -5,8 +5,12 @@
 /hal-arm
 
 # The deployment config holds the MQTT password, and the README's install
-# recipe has you create it right here in the clone.
-/hal.yaml
+# recipe has you create it right here in the clone. Unanchored and with a
+# wildcard, so a copy under config/ or an editor backup is covered too - the
+# example is exempted explicitly.
+hal.yaml*
+!hal.yaml.example
+config/
 *.crt
 *.key
 *.pem

@@ -2,9 +2,12 @@ module github.com/mwuertinger/hal
 
 go 1.25
 
-// Pinned so that the binary that ships is not built by whatever toolchain
-// happens to be on the builder's PATH: the standard library is most of HAL's
-// attack surface, and its fixes arrive as toolchain releases.
+// A floor, not a pin: a newer local toolchain is used as-is, and
+// GOTOOLCHAIN=local ignores this line entirely. What it does guarantee is that
+// nobody builds with something older, which matters because the standard
+// library is most of HAL's attack surface and its fixes ship as toolchain
+// releases. Note that an offline builder on an older toolchain will fail here
+// rather than silently using it. CI takes its version from this file.
 toolchain go1.26.8
 
 require (

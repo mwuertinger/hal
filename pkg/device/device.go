@@ -81,11 +81,24 @@ func addDevice(id, name, location string, typ config.DeviceType) error {
 		return fmt.Errorf("invalid name: %s", name)
 	}
 
+	// Reserved under the lock, so the check and the insert are one step: two
+	// concurrent registrations of the same id would otherwise both pass the
+	// check, and the loser would be overwritten in the map with its
+	// subscriptions and its goroutine still running.
 	mu.Lock()
-	_, duplicate := devices[id]
-	mu.Unlock()
-	if duplicate {
+	if _, duplicate := devices[id]; duplicate {
+		mu.Unlock()
 		return fmt.Errorf("duplicate device id: %s", id)
+	}
+	devices[id] = nil
+	mu.Unlock()
+
+	release := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if devices[id] == nil {
+			delete(devices, id)
+		}
 	}
 
 	var dev Device
@@ -97,10 +110,12 @@ func addDevice(id, name, location string, typ config.DeviceType) error {
 		// in-flight page load for the duration.
 		sw, err := NewSonoffMqttSwitch(id, name, location)
 		if err != nil {
-			return fmt.Errorf("device %s: %w", id, err)
+			release()
+			return err
 		}
 		dev = sw
 	default:
+		release()
 		return fmt.Errorf("invalid typ: %s", typ)
 	}
 
@@ -117,6 +132,10 @@ func List() []Device {
 
 	list := make([]Device, 0, len(devices))
 	for _, d := range devices {
+		if d == nil {
+			// Reserved by an addDevice still constructing it.
+			continue
+		}
 		list = append(list, d)
 	}
 	sort.Slice(list, func(i, j int) bool {
@@ -173,6 +192,9 @@ func Shutdown() {
 	mu.RLock()
 	devs := make([]Device, 0, len(devices))
 	for _, d := range devices {
+		if d == nil {
+			continue
+		}
 		devs = append(devs, d)
 	}
 	mu.RUnlock()

@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ type Fake struct {
 	mu        sync.Mutex
 	published []Published
 	subs      map[string][]chan Notification
+	onConnFns []func()
+	dropped   int
 	closed    bool
 
 	// PublishErr, when set, is returned by every Publish.
@@ -47,15 +50,47 @@ func (f *Fake) Publish(topic string, msg string) error {
 	return nil
 }
 
-func (f *Fake) Subscribe(topic string) (<-chan Notification, error) {
+func (f *Fake) Subscribe(topics ...string) (<-chan Notification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(topics) == 0 {
+		return nil, errors.New("no topics given")
+	}
 	if f.SubscribeErr != nil {
-		return nil, f.SubscribeErr
+		// Wrapped the way the real broker wraps it, so a test asserting on the
+		// message is asserting on something production would also produce.
+		return nil, fmt.Errorf("subscribe to %s: %w", topics[0], f.SubscribeErr)
 	}
 	c := make(chan Notification, notificationQueue)
-	f.subs[topic] = append(f.subs[topic], c)
+	for _, topic := range topics {
+		f.subs[topic] = append(f.subs[topic], c)
+	}
 	return c, nil
+}
+
+func (f *Fake) OnReconnect(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onConnFns = append(f.onConnFns, fn)
+}
+
+// Reconnect runs the registered reconnect hooks, as the real broker does after
+// re-establishing a connection.
+func (f *Fake) Reconnect() {
+	f.mu.Lock()
+	hooks := append([]func(){}, f.onConnFns...)
+	f.mu.Unlock()
+
+	for _, hook := range hooks {
+		hook()
+	}
+}
+
+// Dropped reports how many notifications Deliver could not hand over.
+func (f *Fake) Dropped() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dropped
 }
 
 func (f *Fake) Shutdown() {
@@ -74,16 +109,23 @@ func (f *Fake) Shutdown() {
 }
 
 // Deliver sends a notification to everything subscribed to topic, and reports
-// how many subscribers received it.
+// how many subscribers received it. Like the real broker it drops rather than
+// blocks, so a test with a full queue fails on the count instead of hanging.
 func (f *Fake) Deliver(topic, msg string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	n := Notification{Timestamp: time.Now(), Topic: topic, Msg: msg}
+	delivered := 0
 	for _, c := range f.subs[topic] {
-		c <- n
+		select {
+		case c <- n:
+			delivered++
+		default:
+			f.dropped++
+		}
 	}
-	return len(f.subs[topic])
+	return delivered
 }
 
 // Published returns the calls to Publish so far, oldest first.
@@ -91,6 +133,25 @@ func (f *Fake) Published() []Published {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]Published(nil), f.published...)
+}
+
+// Channels returns the distinct subscription channels handed out, so a test
+// can assert that one subscriber took one channel for all of its topics.
+func (f *Fake) Channels() []chan Notification {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	seen := make(map[chan Notification]bool)
+	var out []chan Notification
+	for _, channels := range f.subs {
+		for _, c := range channels {
+			if !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
+		}
+	}
+	return out
 }
 
 // Topics returns the subscribed topics, for a test that wants to assert on

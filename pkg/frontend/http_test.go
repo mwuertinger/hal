@@ -2,9 +2,12 @@ package frontend
 
 import (
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +137,44 @@ func TestUnsafeMethodsAreRejected(t *testing.T) {
 		if resp.StatusCode != tc.want {
 			t.Errorf("%s %s = %d, want %d", tc.method, tc.path, resp.StatusCode, tc.want)
 		}
+	}
+}
+
+// TestUnknownPathIs404 pins "GET /{$}": without the {$} the root pattern is a
+// catch-all prefix, and every unknown URL would answer 200 with the home page.
+func TestUnknownPathIs404(t *testing.T) {
+	srv := newServer(t)
+
+	for _, path := range []string{"/nope", "/api", "/api/", "/deep/path"} {
+		resp := do(t, "GET", srv.URL+path, "")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", path, resp.StatusCode)
+		}
+	}
+}
+
+// TestDeviceIdComesFromThePathValue covers the mux.Vars replacement: the id has
+// to be the decoded final segment and nothing else.
+func TestDeviceIdComesFromThePathValue(t *testing.T) {
+	srv := newServer(t)
+
+	// A device id that is not registered must 404 from the lookup, whatever it
+	// contains - and must not be mistaken for a longer path.
+	for _, path := range []string{"/api/a%2Fb", "/api/%20x", "/api/lamp1%0Aforged"} {
+		resp := do(t, "PUT", srv.URL+path, "true")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("PUT %s = %d, want 404", path, resp.StatusCode)
+		}
+	}
+
+	// And the registered one still resolves.
+	if resp := do(t, "PUT", srv.URL+"/api/lamp1", "true"); resp.StatusCode != http.StatusOK {
+		t.Errorf("PUT /api/lamp1 = %d, want 200", resp.StatusCode)
+	}
+
+	// A sub-path is not a device: {device} must not match across a separator.
+	if resp := do(t, "PUT", srv.URL+"/api/lamp1/extra", "true"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("PUT /api/lamp1/extra = %d, want 404", resp.StatusCode)
 	}
 }
 
@@ -343,6 +384,38 @@ func TestWebsocketRejectsForeignOrigin(t *testing.T) {
 	}
 }
 
+// TestHostCheckCoversTheWebsocket: the middleware wraps the whole router, and
+// the websocket is the route where a rebinding attacker gets the most - the
+// live event stream. Exempting it would be silent.
+func TestHostCheckCoversTheWebsocket(t *testing.T) {
+	srv := newServer(t)
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest("GET", srv.URL+"/api/ws", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "rebind.attacker.test"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Origin", "http://"+u.Host)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMisdirectedRequest {
+		t.Errorf("websocket upgrade with a foreign Host = %d, want 421", resp.StatusCode)
+	}
+}
+
 func TestWebsocketAcceptsSameOrigin(t *testing.T) {
 	srv := newServer(t)
 
@@ -403,6 +476,11 @@ func TestWebsocketClientLimit(t *testing.T) {
 		conns = append(conns, conn)
 	}
 
+	// Dialling returns as soon as the 101 is read, and registration happens
+	// several statements later, so without this the client past the ceiling can
+	// arrive while the map still has room.
+	waitClients(t, wsMaxClients)
+
 	// The handshake still succeeds - the ceiling is enforced after the upgrade
 	// - but the connection is closed immediately with 1013 Try Again Later.
 	conn, _, err := wsDial(t, srv, srv.URL)
@@ -433,6 +511,12 @@ func TestWebsocketDeliversEvents(t *testing.T) {
 	}()
 
 	srv := newServer(t)
+
+	// httptest.Server.Close() does not wait for hijacked connections, so the
+	// previous test's clients may still be registered. Without this the dial
+	// below can be refused at the ceiling, or waitClients(1) can be satisfied
+	// by a leftover on its way out while this client is not yet registered.
+	waitClients(t, 0)
 
 	conn, _, err := wsDial(t, srv, srv.URL)
 	if err != nil {
@@ -506,4 +590,211 @@ func TestShutdownTwice(t *testing.T) {
 		t.Fatalf("Start() after Shutdown(): %v", err)
 	}
 	Shutdown()
+}
+
+// TestWebsocketClosesTheConnection is the fd-leak regression test. Nothing else
+// closes a hijacked connection: leaving it open costs a file descriptor per
+// disconnect against LimitNOFILE=1024, and the process stays up as it runs out,
+// so systemd never restarts it. It also strands a browser that closed cleanly
+// in CLOSING, waiting for a server half it never gets, so its onclose never
+// fires and it never reconnects.
+func TestWebsocketClosesTheConnection(t *testing.T) {
+	if _, err := os.Stat("/proc/self/fd"); err != nil {
+		t.Skip("no /proc/self/fd to count descriptors with")
+	}
+
+	srv := newServer(t)
+	waitClients(t, 0)
+
+	openFDs := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(entries)
+	}
+
+	// One round first, so anything allocated once - the dialler's idle
+	// machinery - is not counted as growth.
+	for i := 0; i < 5; i++ {
+		conn, _, err := wsDial(t, srv, srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+	}
+	waitClients(t, 0)
+
+	before := openFDs()
+
+	for i := 0; i < 30; i++ {
+		conn, _, err := wsDial(t, srv, srv.URL)
+		if err != nil {
+			t.Fatalf("connection %d: %v", i, err)
+		}
+		conn.Close()
+	}
+	waitClients(t, 0)
+
+	if after := openFDs(); after > before+5 {
+		t.Errorf("open descriptors went %d -> %d over 30 connect/disconnect cycles", before, after)
+	}
+}
+
+// TestWriterPings: a phone that leaves wifi without closing is otherwise only
+// noticed by TCP keepalive, minutes later, while the page keeps showing state
+// it is no longer being sent.
+//
+// It drives writePump directly on its own server so the interval can be short,
+// rather than shortening a package variable that live connections are reading.
+func TestWriterPings(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		go writePump(&wsClient{conn: conn, send: make(chan device.Event, 1)}, 20*time.Millisecond)
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Scheme = "ws"
+
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), http.Header{"Origin": {srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	pinged := make(chan struct{}, 1)
+	conn.SetPingHandler(func(string) error {
+		select {
+		case pinged <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+
+	// A ping handler only runs from inside a read.
+	go func() {
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-pinged:
+	case <-time.After(5 * time.Second):
+		t.Error("no ping arrived: a dead connection would only be noticed by TCP keepalive")
+	}
+}
+
+// TestSlowClientIsDropped: the broadcaster must never block on one unresponsive
+// browser. It is the only reader of device.Events(), and a write that blocks
+// stops it draining, which backs up into the device layer and the lock every
+// page load needs.
+//
+// Driven with a synthetic event channel rather than through the broker: the
+// device layer drops events of its own once its queue is full, so flooding the
+// broker never delivers enough here to fill a socket.
+func TestSlowClientIsDropped(t *testing.T) {
+	shutdown = make(chan interface{})
+	events := make(chan device.Event)
+
+	wg.Add(1)
+	go broadcast(events)
+	defer func() {
+		close(shutdown)
+		wg.Wait()
+	}()
+
+	srv := newServer(t)
+	waitClients(t, 0)
+
+	// Connected, and then never read from - a phone whose screen went off.
+	conn, _, err := wsDial(t, srv, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waitClients(t, 1)
+
+	// Push until the client is dropped: first its queue fills, then the socket
+	// stops accepting, then the broadcaster takes the drop path. Every send
+	// here must return promptly - that is the property under test.
+	deadline := time.Now().Add(20 * time.Second)
+	for i := 0; clientCount() > 0; i++ {
+		if time.Now().After(deadline) {
+			t.Fatal("the client was never dropped")
+		}
+
+		sent := make(chan struct{})
+		go func() {
+			events <- device.Event{DeviceId: "lamp1", Payload: device.EventPayloadSwitch{State: i%2 == 0}}
+			close(sent)
+		}()
+
+		select {
+		case <-sent:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the broadcaster blocked on a client that stopped reading")
+		}
+	}
+
+	// Dropping the client has to close the socket too. This is the one path
+	// where nothing else will: the connection is still perfectly healthy at the
+	// TCP level - the browser has simply stopped reading - so the reader
+	// goroutine would sit in ReadMessage holding the descriptor indefinitely.
+	// That is a file descriptor per dropped client against LimitNOFILE=1024,
+	// with the process staying up as it runs out.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		_, _, err := conn.ReadMessage()
+		if err == nil {
+			continue
+		}
+		// A timeout means the server never hung up; anything else means it did.
+		// gorilla does not wrap the net error, so this checks the interface
+		// rather than errors.Is.
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Error("the dropped client's connection was left open")
+		}
+		return
+	}
+}
+
+// TestBroadcasterSurvivesNoDevices: device.Events() closes immediately when
+// nothing is registered, which used to end the broadcaster during startup -
+// logging "shutdown complete" as the server came up, and leaving nobody to
+// drain the clients at the real shutdown.
+func TestBroadcasterSurvivesNoDevices(t *testing.T) {
+	shutdown = make(chan interface{})
+
+	closed := make(chan device.Event)
+	close(closed)
+
+	wg.Add(1)
+	go broadcast(closed)
+
+	srv := newServer(t)
+	waitClients(t, 0)
+
+	conn, _, err := wsDial(t, srv, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waitClients(t, 1)
+
+	// Still running: the drain happens at shutdown, not at startup.
+	close(shutdown)
+	wg.Wait()
+
+	waitClients(t, 0)
 }

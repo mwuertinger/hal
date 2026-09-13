@@ -291,3 +291,65 @@ func TestUnexpectedTopicIsRejected(t *testing.T) {
 		t.Error("LastKnownState() = false: an unexpected topic overwrote the real state")
 	}
 }
+
+// TestStateIsQueriedAgainAfterAReconnect: nothing is retained while the
+// connection is down and the session is clean, so every transition during an
+// outage is lost - a lamp switched by its own button, or by another client.
+// Without asking again, the UI shows the pre-outage state until the device's
+// next telemetry frame, up to five minutes later.
+func TestStateIsQueriedAgainAfterAReconnect(t *testing.T) {
+	broker := mqtt.NewFake()
+	registerOne(t, broker)
+
+	before := len(broker.Published())
+	broker.Reconnect()
+
+	var queries int
+	for _, p := range broker.Published()[before:] {
+		if p.Topic == "cmnd/lamp1/POWER" && p.Msg == "" {
+			queries++
+		}
+	}
+	if queries != 1 {
+		t.Errorf("%d state queries after a reconnect, want 1: %v", queries, broker.Published()[before:])
+	}
+}
+
+// TestBothTopicsShareOneChannel: the device's two topics contradict each other
+// by design, so they have to arrive in the order the broker sent them. Two
+// subscriptions read by a select would leave that order to the scheduler - and
+// a tele/<id>/STATE frame restating the old state, applied after the
+// stat/<id>/POWER that superseded it, records the lamp in the state it just
+// left.
+func TestBothTopicsShareOneChannel(t *testing.T) {
+	broker := mqtt.NewFake()
+	dev := registerOne(t, broker)
+
+	if got := len(broker.Channels()); got != 1 {
+		t.Fatalf("the device holds %d subscription channels, want 1", got)
+	}
+
+	events := dev.Events()
+
+	// The pair that inverts: telemetry restating "off", immediately followed by
+	// the echo of a command that turned it on.
+	broker.Deliver("tele/lamp1/STATE", `{"POWER":"OFF"}`)
+	broker.Deliver("stat/lamp1/POWER", "ON")
+
+	var last bool
+	for i := 0; i < 2; i++ {
+		select {
+		case event := <-events:
+			last = event.Payload.(EventPayloadSwitch).State
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of 2 events arrived", i)
+		}
+	}
+
+	if !last {
+		t.Error("the last event was off: the two topics were applied out of order")
+	}
+	if !dev.LastKnownState() {
+		t.Error("LastKnownState() = false, want the later message to win")
+	}
+}

@@ -62,8 +62,25 @@ type Broker interface {
 	Connect(mqttConfig config.Mqtt) error
 	Shutdown()
 	Publish(topic string, msg string) error
-	Subscribe(topic string) (<-chan Notification, error)
+
+	// Subscribe delivers every message on any of topics to one channel. The
+	// topics of one subscriber share a channel deliberately: messages are
+	// delivered in order, and two channels read by a select would put that
+	// order back at the mercy of the scheduler.
+	Subscribe(topics ...string) (<-chan Notification, error)
+
+	// OnReconnect registers f to run after the connection has been
+	// re-established and the subscriptions re-issued. Nothing is retained
+	// while the connection is down, so a subscriber that needs the current
+	// state of the world has to ask for it again here.
+	OnReconnect(f func())
 }
+
+// ErrConfig marks a failure that no amount of retrying will fix - an
+// unreadable CA file, a CA file with no certificate in it. main turns it into
+// exit 78, which hal.service names in RestartPreventExitStatus= so the unit
+// fails visibly instead of restarting every five seconds forever.
+var ErrConfig = errors.New("configuration error")
 
 type broker struct {
 	client paho.Client
@@ -72,13 +89,22 @@ type broker struct {
 	// against Shutdown: a message that arrives while Shutdown is running
 	// blocks on the mutex and then sees closed, rather than sending on a
 	// channel that is about to be closed underneath it.
-	mu     sync.Mutex
-	subs   map[string][]chan Notification
-	closed bool
+	mu        sync.Mutex
+	subs      map[string][]chan Notification
+	onConnFns []func()
+	dropped   map[string]int
+	closed    bool
+
+	// done is closed by Shutdown, which is what ends a resubscribe retry.
+	done chan struct{}
 }
 
 func New() Broker {
-	return &broker{subs: make(map[string][]chan Notification)}
+	return &broker{
+		subs:    make(map[string][]chan Notification),
+		dropped: make(map[string]int),
+		done:    make(chan struct{}),
+	}
 }
 
 func (s *broker) Connect(mqttConfig config.Mqtt) error {
@@ -118,13 +144,18 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 			log.Printf("MQTT message on unrouted topic %q", m.Topic())
 		})
 
-	s.client = paho.NewClient(opts)
+	client := paho.NewClient(opts)
+	s.client = client
 
-	token := s.client.Connect()
+	token := client.Connect()
 	if !token.WaitTimeout(connectTimeout) {
+		// Cleared, so a caller that decides to retry is not told it is
+		// already connected to a client that never connected.
+		s.client = nil
 		return fmt.Errorf("connect to %s timed out after %v", mqttConfig.Server, connectTimeout)
 	}
 	if err := token.Error(); err != nil {
+		s.client = nil
 		// Unlike the client this replaced, a refused CONNACK - a wrong
 		// password, say - arrives here as an error instead of being reported
 		// as a successful connection.
@@ -143,7 +174,7 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 func tlsConfig(caPath string) (*tls.Config, error) {
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, fmt.Errorf("unable to read mqtt.ca-path: %v", err)
+		return nil, fmt.Errorf("%w: unable to read mqtt.ca-path: %w", ErrConfig, err)
 	}
 
 	pool := x509.NewCertPool()
@@ -151,7 +182,7 @@ func tlsConfig(caPath string) (*tls.Config, error) {
 	// an empty pool, which fails later as an opaque handshake error rather
 	// than as "your CA file has no certificate in it".
 	if !pool.AppendCertsFromPEM(caCert) {
-		return nil, fmt.Errorf("mqtt.ca-path %q contains no PEM certificate", caPath)
+		return nil, fmt.Errorf("%w: mqtt.ca-path %q contains no PEM certificate", ErrConfig, caPath)
 	}
 
 	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
@@ -179,6 +210,7 @@ func (s *broker) onConnect(client paho.Client) {
 	for topic := range s.subs {
 		topics = append(topics, topic)
 	}
+	hooks := append([]func(){}, s.onConnFns...)
 	closed := s.closed
 	s.mu.Unlock()
 
@@ -186,16 +218,72 @@ func (s *broker) onConnect(client paho.Client) {
 		return
 	}
 
+	var failed []string
 	for _, topic := range topics {
 		if err := s.subscribe(client, topic); err != nil {
-			// Nothing here can recover: a failed re-subscribe means this topic
-			// is dark until the next reconnect. Say so loudly.
-			log.Printf("MQTT resubscribe to %q failed: %v", topic, err)
+			log.Printf("MQTT subscribe to %q failed: %v", topic, err)
+			failed = append(failed, topic)
 		}
 	}
 
+	if len(failed) > 0 {
+		// A topic that stays unsubscribed is a device that silently never
+		// updates again, so keep trying rather than leaving one log line
+		// behind. The retry ends when the connection drops, at which point
+		// the next onConnect takes over.
+		go s.retrySubscribes(client, failed)
+	}
+
 	if len(topics) > 0 {
-		log.Printf("MQTT subscribed to %d topic(s)", len(topics))
+		log.Printf("MQTT subscribed to %d of %d topic(s)", len(topics)-len(failed), len(topics))
+	}
+
+	// Hooks run last and off this goroutine: they publish, and paho calls
+	// onConnect from a path that should not be waiting on a PUBACK.
+	if len(hooks) > 0 {
+		go func() {
+			for _, hook := range hooks {
+				hook()
+			}
+		}()
+	}
+}
+
+// retrySubscribes keeps trying the topics onConnect could not subscribe to,
+// for as long as this connection lasts.
+func (s *broker) retrySubscribes(client paho.Client, topics []string) {
+	delay := 5 * time.Second
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-time.After(delay):
+		}
+
+		if !client.IsConnectionOpen() {
+			// The connection went away; the next onConnect re-issues
+			// everything anyway.
+			return
+		}
+
+		var failed []string
+		for _, topic := range topics {
+			if err := s.subscribe(client, topic); err != nil {
+				failed = append(failed, topic)
+			} else {
+				log.Printf("MQTT subscribe to %q recovered", topic)
+			}
+		}
+		if len(failed) == 0 {
+			return
+		}
+		topics = failed
+
+		if delay < time.Minute {
+			delay *= 2
+		}
+		log.Printf("MQTT still cannot subscribe to %v, retrying in %v", topics, delay)
 	}
 }
 
@@ -208,7 +296,21 @@ func (s *broker) subscribe(client paho.Client, topic string) error {
 	if !token.WaitTimeout(subscribeTimeout) {
 		return fmt.Errorf("timed out after %v", subscribeTimeout)
 	}
-	return token.Error()
+	if err := token.Error(); err != nil {
+		return err
+	}
+
+	// A broker that refuses a subscription - an ACL that does not grant the
+	// topic - answers SUBACK with 0x80, which paho records as the granted QoS
+	// and does not treat as an error. Unchecked, the device is registered,
+	// shown in the UI, and reports off forever.
+	if subToken, ok := token.(*paho.SubscribeToken); ok {
+		if qos, granted := subToken.Result()[topic]; granted && qos == 0x80 {
+			return fmt.Errorf("the broker refused the subscription (SUBACK 0x80); check its ACL")
+		}
+	}
+
+	return nil
 }
 
 // deliver fans one message out to the subscribers of its topic. It never
@@ -227,16 +329,29 @@ func (s *broker) deliver(topic, payload string) {
 		select {
 		case c <- notification:
 		default:
-			log.Printf("MQTT %s: subscriber %d notifications behind, dropping", topic, notificationQueue)
+			// Counted rather than logged per message: a subscriber that has
+			// stopped reading would otherwise write to the SD card as fast as
+			// the broker can deliver.
+			s.dropped[topic]++
+			if n := s.dropped[topic]; n == 1 || n%100 == 0 {
+				log.Printf("MQTT %s: subscriber %d notifications behind, %d dropped so far",
+					topic, notificationQueue, n)
+			}
 		}
 	}
 }
 
+func (s *broker) OnReconnect(f func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onConnFns = append(s.onConnFns, f)
+}
+
 func (s *broker) Shutdown() {
 	if s.client != nil {
-		// Disconnect stops the reader, so no further deliver call can start
-		// after it returns; one already inside deliver is holding mu, which
-		// the lock below waits for.
+		// Disconnect is a deadline rather than a join - it returns after the
+		// quiesce period whether or not the teardown finished - so it is the
+		// mutex below, not this call, that makes a delivery in flight safe.
 		s.client.Disconnect(250)
 	}
 
@@ -247,9 +362,17 @@ func (s *broker) Shutdown() {
 		return
 	}
 	s.closed = true
+	close(s.done)
+
+	// Deduplicated: one subscriber's topics share a channel, so walking the
+	// map without this closes that channel once per topic.
+	seen := make(map[chan Notification]bool, len(s.subs))
 	for _, channels := range s.subs {
 		for _, c := range channels {
-			close(c)
+			if !seen[c] {
+				seen[c] = true
+				close(c)
+			}
 		}
 	}
 	s.subs = nil
@@ -261,10 +384,14 @@ func (s *broker) Publish(topic string, msg string) error {
 	if s.client == nil {
 		return errors.New("not connected")
 	}
-	if !s.client.IsConnected() {
-		// Without this, paho queues the message for the next connection and
-		// reports success, so a command sent while the broker is down looks
-		// like it reached the lamp.
+	// IsConnectionOpen, not IsConnected: with AutoReconnect set the latter
+	// reports true for the whole reconnect window, and a QoS 1 publish in that
+	// state is stored rather than sent - the token never completes, the caller
+	// waits out publishTimeout and is told the command failed, and then paho
+	// replays the stored message when the connection returns. A lamp switching
+	// itself on minutes after the user was told the switch failed is worse
+	// than a switch that plainly did not work.
+	if !s.client.IsConnectionOpen() {
 		return errors.New("broker not connected")
 	}
 
@@ -277,9 +404,17 @@ func (s *broker) Publish(topic string, msg string) error {
 	return token.Error()
 }
 
-func (s *broker) Subscribe(topic string) (<-chan Notification, error) {
+// Subscribe registers one channel for every topic given. One channel rather
+// than one per topic: paho delivers in order, and a consumer that had to
+// select between two channels would lose that order - a tele/<id>/STATE frame
+// restating the old state could then be applied after the stat/<id>/POWER that
+// superseded it, leaving the device recorded in the state it just left.
+func (s *broker) Subscribe(topics ...string) (<-chan Notification, error) {
 	if s.client == nil {
 		return nil, errors.New("not connected")
+	}
+	if len(topics) == 0 {
+		return nil, errors.New("no topics given")
 	}
 
 	c := make(chan Notification, notificationQueue)
@@ -289,18 +424,20 @@ func (s *broker) Subscribe(topic string) (<-chan Notification, error) {
 		s.mu.Unlock()
 		return nil, errors.New("broker is shut down")
 	}
-	first := len(s.subs[topic]) == 0
-	s.subs[topic] = append(s.subs[topic], c)
+	fresh := make([]string, 0, len(topics))
+	for _, topic := range topics {
+		if len(s.subs[topic]) == 0 {
+			fresh = append(fresh, topic)
+		}
+		s.subs[topic] = append(s.subs[topic], c)
+	}
 	s.mu.Unlock()
 
-	if !first {
-		// Already subscribed at the broker; deliver fans out to both channels.
-		return c, nil
-	}
-
-	if err := s.subscribe(s.client, topic); err != nil {
-		s.unsubscribe(topic, c)
-		return nil, fmt.Errorf("subscribe to %s: %w", topic, err)
+	for _, topic := range fresh {
+		if err := s.subscribe(s.client, topic); err != nil {
+			s.unsubscribe(topics, c)
+			return nil, fmt.Errorf("subscribe to %s: %w", topic, err)
+		}
 	}
 
 	return c, nil
@@ -308,19 +445,21 @@ func (s *broker) Subscribe(topic string) (<-chan Notification, error) {
 
 // unsubscribe removes one channel again, so a failed Subscribe does not leave
 // a subscriber behind that onConnect would then try to re-establish forever.
-func (s *broker) unsubscribe(topic string, c chan Notification) {
+func (s *broker) unsubscribe(topics []string, c chan Notification) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	remaining := s.subs[topic][:0]
-	for _, existing := range s.subs[topic] {
-		if existing != c {
-			remaining = append(remaining, existing)
+	for _, topic := range topics {
+		remaining := s.subs[topic][:0]
+		for _, existing := range s.subs[topic] {
+			if existing != c {
+				remaining = append(remaining, existing)
+			}
 		}
-	}
-	if len(remaining) == 0 {
-		delete(s.subs, topic)
-	} else {
-		s.subs[topic] = remaining
+		if len(remaining) == 0 {
+			delete(s.subs, topic)
+		} else {
+			s.subs[topic] = remaining
+		}
 	}
 }

@@ -54,7 +54,7 @@
                 <!-- The heading id is the index, not the name: a location is free text
                      from the config file, and an id with a space in it silently breaks
                      the aria-labelledby reference. -->
-                <h2 id="room-{{ $i }}">{{ $room.Name }}</h2>
+                <h2 id="room-{{ $i }}" title="{{ $room.Name }}">{{ $room.Name }}</h2>
                 <span class="room-count">{{ $room.OnCount }}/{{ len $room.Devices }} on</span>
             </div>
             <ul class="devices" role="list">

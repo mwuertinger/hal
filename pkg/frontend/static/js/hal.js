@@ -92,7 +92,10 @@
     var announceEl = document.getElementById("announce");
 
     function announce(text) {
-        if (announceEl) {
+        // Only when it changes: Tasmota republishes tele/<id>/STATE on a timer,
+        // so announcing every event would have a screen reader say "Desk Lamp
+        // off" for each device every few minutes with nothing having happened.
+        if (announceEl && announceEl.textContent !== text) {
             announceEl.textContent = text;
         }
     }
@@ -165,6 +168,19 @@
     // change handler.
     var burst = Object.create(null);
 
+    // Per device, a count of authoritative events seen. A request compares it
+    // against the value when it was sent: an event that arrived in between is
+    // newer than the request, and must not be overwritten by the request's own
+    // result. Without this, suppressing the mid-request repaint - which is what
+    // stops stale telemetry reverting an optimistic switch - meant a genuinely
+    // newer event was dropped instead, and the row kept the value the user
+    // asked for while the lamp sat in the state someone else had just set.
+    var eventSeq = Object.create(null);
+
+    // Per device, the timer clearing its failure cue, so a second failure
+    // restarts the cue instead of inheriting the first one's deadline.
+    var failedTimers = Object.create(null);
+
     function supersede(id, state) {
         // Only drop the guard when nothing is outstanding. An event that lands
         // mid-request is not necessarily newer than the request: Tasmota
@@ -176,6 +192,7 @@
             delete inFlight[id];
         }
         epoch[id] = (epoch[id] || 0) + 1;
+        eventSeq[id] = (eventSeq[id] || 0) + 1;
         if (burst[id]) {
             // An authoritative event is the newest thing known about this device,
             // exactly like a request that landed. Treating it as one means a burst
@@ -211,7 +228,10 @@
                 epoch: epoch[id] || 0,
                 state: row.classList.contains("is-on"),
                 succeeded: false,
-                failed: false
+                failed: false,
+                // Set when an event's repaint was held back because a request
+                // was in flight; the burst then reconciles against the server.
+                suppressed: false
             };
         }
 
@@ -225,6 +245,10 @@
         row.classList.add("is-pending");
 
         function send() {
+            // What we knew when this request went out. Anything that arrives
+            // after it is newer than its result.
+            var atSend = eventSeq[id] || 0;
+
             return request("/api/" + encodeURIComponent(id), {
                 method: "PUT",
                 body: target ? "true" : "false"
@@ -244,7 +268,12 @@
                 if (burst[id]) {
                     burst[id].succeeded = true;
                     burst[id].failed = false;
-                    burst[id].state = target;
+                    if ((eventSeq[id] || 0) === atSend) {
+                        burst[id].state = target;
+                    }
+                    // Otherwise an event landed while this was in flight and
+                    // already recorded what it said; a command that has only
+                    // just been published does not get to overrule it.
                 }
             }).catch(function (err) {
                 var failure = row.querySelector(".device-name").textContent +
@@ -268,7 +297,23 @@
 
                 var b = burst[id];
                 delete burst[id];
-                if (!b || !b.failed) {
+                if (!b) {
+                    return;
+                }
+
+                if (b.suppressed) {
+                    // An event arrived mid-request and its repaint was held
+                    // back, because at that moment there was no way to tell
+                    // whether it predated the command - Tasmota republishes
+                    // the old state on a timer - or superseded it. Guessing
+                    // either way is wrong half the time, so ask: /api/state is
+                    // the server's own view once everything has landed, and
+                    // applyStates has the epoch guard that stops a stale
+                    // snapshot overwriting anything newer.
+                    resync();
+                }
+
+                if (!b.failed) {
                     return;
                 }
 
@@ -280,9 +325,15 @@
                 // The switch snapping back on its own is otherwise the only
                 // sign of a failure, and the reason for it is written to a log
                 // panel that is closed by default.
+                clearTimeout(failedTimers[id]);
+                row.classList.remove("is-failed");
+                // Reading offsetWidth restarts the animation; without it a
+                // second failure within the window is not shown at all.
+                void row.offsetWidth;
                 row.classList.add("is-failed");
-                setTimeout(function () {
+                failedTimers[id] = setTimeout(function () {
                     row.classList.remove("is-failed");
+                    delete failedTimers[id];
                 }, 2000);
                 if (!b.succeeded) {
                     epoch[id] = b.epoch;
@@ -390,7 +441,6 @@
                 return;
             }
             applyStates(states, seen);
-            lastContact = Date.now();
             resyncRetry = 0;
             if (socketOpen) {
                 setStatus("live", "Live");
@@ -414,6 +464,7 @@
 
     var retry = 0;
     var socket = null;
+    var reconnectTimer = null;
 
     // lastContact is when the socket last proved it was alive. A socket that
     // dies without a close frame - a phone in a pocket, a router that dropped
@@ -427,7 +478,8 @@
         // Back off up to 30s so a server that stays down is not hammered.
         var delay = Math.min(1000 * Math.pow(2, retry++), 30000);
         setStatus("down", "Reconnecting");
-        setTimeout(connect, delay);
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, delay);
     }
 
     function connect() {
@@ -478,6 +530,8 @@
                 return;
             }
 
+            lastContact = Date.now();
+
             if (!event.Payload || typeof event.Payload.State !== "boolean") {
                 // Not a switch event. Coercing an unknown payload with !! would
                 // paint the row off, which for a sensor reading is a lie.
@@ -486,16 +540,19 @@
             }
 
             var state = event.Payload.State;
-            lastContact = Date.now();
             supersede(event.DeviceId, state);
 
             var row = rowFor(event.DeviceId);
-            // Not while a request is outstanding: the optimistic state is the
-            // newer fact until its own echo arrives, and this event may predate
-            // the command. The request's own success or failure repaints.
+            // Not while a request is outstanding: this event may be the
+            // telemetry frame that restates the state we are switching away
+            // from, and repainting from it makes the switch bounce back while
+            // the lamp is on its way. The burst resolves it against the server
+            // when it settles - see "suppressed" in the change handler.
             if (row && !queued[event.DeviceId]) {
                 row.querySelector("input[data-device]").checked = state;
                 paint(row, state);
+            } else if (burst[event.DeviceId]) {
+                burst[event.DeviceId].suppressed = true;
             }
 
             var name = row ? row.querySelector(".device-name").textContent : event.DeviceId;
@@ -521,7 +578,9 @@
         };
 
         socket.onerror = function () {
-            socket.close();
+            // self, not the module-level socket, which may already have been
+            // replaced by a newer connection.
+            self.close();
         };
     }
 
@@ -531,22 +590,53 @@
     // socket, because the old one may be talking to nobody.
     function recheck() {
         if (!socketOpen) {
+            // Coming back to a page that is waiting out a backoff should not
+            // mean waiting out the rest of it.
+            if (socket === null) {
+                retry = 0;
+                clearTimeout(reconnectTimer);
+                connect();
+            }
             return;
         }
+
         if (Date.now() - lastContact > STALE_AFTER && socket) {
-            socket.close();
+            // Take the reconnect over rather than leaving it to onclose. A
+            // socket that died without a FIN never completes its closing
+            // handshake, and Chromium then sits in CLOSING for tens of seconds
+            // without firing onclose - during which the old code would call
+            // close() again on every check and never reach the resync below,
+            // so the page stayed frozen on "Live" with nothing reconnecting.
+            var dying = socket;
+            socket = null;
+            socketOpen = false;
+            dying.onclose = null;
+            dying.onmessage = null;
+            dying.onerror = null;
+            dying.close();
+            reconnectLater();
             return;
         }
+
         resync();
+    }
+
+    // Coalesced: a bfcache restore fires pageshow and visibilitychange
+    // together, which would otherwise be two refetches of the same thing.
+    var recheckTimer = null;
+
+    function recheckSoon() {
+        clearTimeout(recheckTimer);
+        recheckTimer = setTimeout(recheck, 50);
     }
 
     document.addEventListener("visibilitychange", function () {
         if (document.visibilityState === "visible") {
-            recheck();
+            recheckSoon();
         }
     });
-    window.addEventListener("online", recheck);
-    window.addEventListener("pageshow", recheck);
+    window.addEventListener("online", recheckSoon);
+    window.addEventListener("pageshow", recheckSoon);
 
     // The switches render disabled, so that a page whose script never ran
     // cannot animate a toggle that talks to nobody. This is the last statement

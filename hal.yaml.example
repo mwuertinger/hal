@@ -10,10 +10,11 @@ http:
   # Address the web frontend listens on. Must match SocketBindAllow= in
   # hal.service, which allows tcp:8080 by default.
   listen-address: :8080
-  # Only needed to reach HAL under a public domain name: IP addresses,
-  # localhost, single-label names and .local/.lan/.home.arpa/.internal are
-  # always accepted. Anything else is refused, so that a public page cannot
-  # point its own domain at HAL and drive it through a visitor's browser.
+  # Only needed to reach HAL under a domain name your network does not own:
+  # IP addresses, single-label names, and names under .local, .lan, .home,
+  # .home.arpa, .internal, .localhost, .box or .localdomain are always
+  # accepted. Anything else is refused, so that a public page cannot point its
+  # own domain at HAL and drive it through a visitor's browser.
   #allowed-hosts:
   #- hal.example.com
 

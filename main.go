@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -43,7 +44,13 @@ func main() {
 
 	mqttBroker := mqtt.New()
 	if err := mqttBroker.Connect(c.Mqtt); err != nil {
-		log.Fatalf("mqttBroker.Connect: %v", err)
+		log.Printf("mqttBroker.Connect: %v", err)
+		if errors.Is(err, mqtt.ErrConfig) {
+			// An unreadable or empty CA file will fail exactly the same way on
+			// the next attempt, so fail the unit rather than restart forever.
+			os.Exit(exitConfig)
+		}
+		os.Exit(1)
 	}
 
 	device.SetMqttBroker(mqttBroker)

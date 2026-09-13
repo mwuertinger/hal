@@ -35,22 +35,12 @@ func TestContentTypesArePinned(t *testing.T) {
 	}
 }
 
-// TestEveryShippedAssetBuilds runs the real embedded FS through the fallible
-// half of the pipeline, and names the file at fault.
-//
-// Its predecessor re-checked contentTypes against the same files buildAssets
-// had already validated at package-variable initialisation - so the only
-// condition it asserted on killed the test binary before it could run, and it
-// could never report anything. This can: buildAssetsFS returns its rejections.
-func TestEveryShippedAssetBuilds(t *testing.T) {
-	built, err := buildAssetsFS(staticFiles)
-	if err != nil {
-		t.Fatalf("the embedded assets do not build: %v", err)
-	}
-	if len(built) == 0 {
-		t.Fatal("no assets were built")
-	}
-}
+// There is deliberately no test that "every shipped asset builds". buildAssets
+// runs during package-variable initialisation, so an asset the pipeline rejects
+// panics with the offending file in the message before any Test function runs -
+// which fails the build, names the file, and cannot be made to fail any earlier
+// by a test that calls buildAssetsFS with the same input. A previous attempt at
+// one asserted on a condition that had already killed the binary.
 
 // TestBuildAssetsRejections covers the three ways the pipeline can be fed
 // something it would otherwise mangle in silence. These run against a synthetic
@@ -151,6 +141,8 @@ func TestAssetHashCoversContentType(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Mutates package state, so this test must not run in parallel with
+	// anything that builds assets.
 	original := contentTypes[".svg"]
 	contentTypes[".svg"] = "image/svg+xml; charset=utf-8"
 	defer func() { contentTypes[".svg"] = original }()

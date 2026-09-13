@@ -30,9 +30,9 @@ type Http struct {
 	ListenAddress string `yaml:"listen-address"`
 
 	// AllowedHosts names the extra Host header values the frontend answers to.
-	// It is only needed for a public domain name pointed at HAL on the LAN:
-	// IP addresses, localhost, single-label names and .local/.lan/.home.arpa
-	// are always accepted. See hostCheck in pkg/frontend.
+	// It is only needed for a domain name the local network does not own: IP
+	// addresses, single-label names and the LAN suffixes are always accepted.
+	// See hostCheck and lanSuffixes in pkg/frontend, which are authoritative.
 	AllowedHosts []string `yaml:"allowed-hosts"`
 }
 
@@ -108,6 +108,16 @@ func normalise(config *Config) {
 	config.Mqtt.Server = strings.TrimSpace(config.Mqtt.Server)
 	config.Mqtt.CaPath = strings.TrimSpace(config.Mqtt.CaPath)
 	config.Http.ListenAddress = strings.TrimSpace(config.Http.ListenAddress)
+
+	// Untrimmed, a leading space here means the name never matches and every
+	// request for it is refused with 421, with nothing in the log to say why.
+	hosts := config.Http.AllowedHosts[:0]
+	for _, host := range config.Http.AllowedHosts {
+		if host = strings.TrimSpace(host); host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	config.Http.AllowedHosts = hosts
 
 	for i := range config.Devices {
 		d := &config.Devices[i]
