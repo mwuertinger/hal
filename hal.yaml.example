@@ -1,7 +1,7 @@
 mqtt:
   # Address of the MQTT broker. The connection is TLS.
   server:         mqtt.example.com:8883
-  # CA certificate used to verify the broker.
+  # CA certificate the broker's own certificate is verified against.
   ca-path:        /etc/hal/ca.crt
   user:           hal
   password:       changeme
@@ -10,6 +10,12 @@ http:
   # Address the web frontend listens on. Must match SocketBindAllow= in
   # hal.service, which allows tcp:8080 by default.
   listen-address: :8080
+  # Only needed to reach HAL under a public domain name: IP addresses,
+  # localhost, single-label names and .local/.lan/.home.arpa/.internal are
+  # always accepted. Anything else is refused, so that a public page cannot
+  # point its own domain at HAL and drive it through a visitor's browser.
+  #allowed-hosts:
+  #- hal.example.com
 
 # sonoff-mqtt-switch is currently the only supported device type. The id is the
 # Tasmota topic name: HAL publishes to cmnd/<id>/POWER and subscribes to

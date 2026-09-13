@@ -1,3 +1,12 @@
 .idea/
-hal-*
-config/
+
+# Build outputs of build.sh.
+/hal-amd64
+/hal-arm
+
+# The deployment config holds the MQTT password, and the README's install
+# recipe has you create it right here in the clone.
+/hal.yaml
+*.crt
+*.key
+*.pem

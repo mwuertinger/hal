@@ -15,9 +15,15 @@ ExecStart=/usr/local/bin/hal -config /etc/hal/hal.yaml
 User=hal
 Group=hal
 
-# HAL calls log.Fatalf() if the MQTT broker is unreachable at startup, so a broker
+# HAL exits non-zero if the MQTT broker is unreachable at startup, so a broker
 # that is not up yet is a normal, recoverable condition.
+#
+# A broken config is not: HAL exits 78 (EX_CONFIG) for anything it could not
+# load or validate, and restarting on that would only produce the same failure
+# every five seconds forever, with the unit reporting "activating" rather than
+# "failed" the whole time.
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=5s
 
 SyslogIdentifier=hal
@@ -56,9 +62,8 @@ KeyringMode=private
 # ---------------------------------------------------------------------------
 # Filesystem
 #
-# The binary embeds its own frontend assets and keeps all state in memory
-# (pkg/persistence is an in-memory sync.Map), so HAL never needs to write
-# anywhere. ProtectSystem=strict makes the whole filesystem read-only and no
+# The binary embeds its own frontend assets and keeps all state in memory, so
+# HAL never needs to write anywhere. ProtectSystem=strict makes the whole filesystem read-only and no
 # ReadWritePaths= is granted, so the service has no writable path at all.
 # ---------------------------------------------------------------------------
 ProtectSystem=strict
