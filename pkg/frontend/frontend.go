@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"path"
 	"sort"
@@ -25,10 +26,9 @@ import (
 //go:embed template/index.html
 var templateFS embed.FS
 
-// The vendored Bootstrap files under static/ deliberately diverge from upstream: their
-// .map files are not shipped and the trailing sourceMappingURL comments are stripped, so
-// that ~963 KB of vendor debug artifacts stay out of the binary. Re-apply both when
-// upgrading Bootstrap.
+// static/ holds the whole frontend: hand-written CSS and JS, no vendored framework.
+// Nothing here is fetched from a CDN at runtime either, because hal.service confines
+// outbound traffic to the LAN.
 //
 //go:embed static
 var staticFS embed.FS
@@ -48,6 +48,16 @@ var (
 // conditional requests altogether; without a validator of our own every page load would
 // re-transfer all assets. Hashing the content rather than stamping a build time also keeps the
 // validator honest across upgrades: the ETag changes exactly when the bytes do.
+func init() {
+	// Go's built-in table has no entry for .woff2 and otherwise falls back to
+	// /etc/mime.types, which comes from a package (media-types) that need not be
+	// installed on the target. Register it so the fonts are not served as
+	// application/octet-stream on a minimal host.
+	if err := mime.AddExtensionType(".woff2", "font/woff2"); err != nil {
+		panic(err)
+	}
+}
+
 func buildStaticETags() map[string]string {
 	etags := make(map[string]string)
 	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
@@ -176,6 +186,10 @@ func Shutdown() {
 type frontendRoom struct {
 	Name    string
 	Devices []frontendDevice
+	// OnCount is rendered in the room header. The template could not count the
+	// devices that are on by itself: text/template has no accumulator.
+	OnCount int
+	AnyOn   bool
 }
 
 type frontendDevice struct {
@@ -207,6 +221,12 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 
 	var frontendRooms []frontendRoom
 	for _, room := range rooms {
+		for _, d := range room.Devices {
+			if d.State {
+				room.OnCount++
+			}
+		}
+		room.AnyOn = room.OnCount > 0
 		frontendRooms = append(frontendRooms, *room)
 	}
 	sort.Slice(frontendRooms, func(i, j int) bool {

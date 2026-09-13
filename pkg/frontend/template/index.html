@@ -1,61 +1,90 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#e8eaee" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#11161d" media="(prefers-color-scheme: dark)">
+    <meta name="mobile-web-app-capable" content="yes">
 
     <title>HAL - Home Automation Link</title>
 
-    <link rel="stylesheet" href="/static/css/bootstrap.min.css">
     <link rel="stylesheet" href="/static/css/hal.css">
-    <script src="/static/js/jquery-3.7.1.min.js"></script>
-    <script src="/static/js/bootstrap.bundle.min.js"></script>
-    <script>
-        $(document).ready(function() {
-            $("input").on("click", function (event) {
-                device = event.target.getAttribute("hal-device")
-                $.ajax({
-                    url: "/api/" + device,
-                    type: 'PUT',
-                    data: event.target.checked.toString()
-                })
-            })
-
-            var connection = new WebSocket("ws://" + document.location.host + "/api/ws");
-            connection.onmessage = function (message) {
-                console.log("received: " + message.data)
-
-                var msg = JSON.parse(message.data)
-                var toggle = $("input[hal-device=" + msg.DeviceId + "]")
-                if (toggle != null) {
-                    toggle.prop("checked", msg.Payload.State)
-                }
-
-                var mqttLog = $("#mqttLog")
-                mqttLog.append(message.data + "<br>")
-            };
-        })
-    </script>
+    <link rel="icon" href="/static/img/favicon.svg" type="image/svg+xml">
+    <script src="/static/js/hal.js" defer></script>
 </head>
 <body>
-    <div class="container">
-        <h1>Home Automation Link 9000</h1>
-
-        {{ range .Rooms }}
-        <h2>{{ .Name }}</h2>
-        {{ range .Devices }}
-        <div>
-        <h3>{{ .Name }}</h3>
-        <label class="switch">
-            <input type="checkbox" hal-device="{{ .ID }}" {{ if .State }}checked="checked"{{ end }}>
-            <span class="slider round"></span>
-        </label>
+<header class="topbar">
+    <div class="wrap topbar-inner">
+        <div class="brand">
+            <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9 18h6M10 21h4"/>
+                <path d="M12 3a6 6 0 0 0-3.6 10.8c.5.4.8.9.9 1.5l.1.7h5.2l.1-.7c.1-.6.4-1.1.9-1.5A6 6 0 0 0 12 3Z"/>
+            </svg>
+            <span class="brand-text">
+                <span class="brand-name">HAL 9000</span>
+                <span class="brand-sub">Home Automation Link</span>
+            </span>
         </div>
-        {{ end }}
-        {{ end }}
-
-        <h2>MQTT Log</h2>
-        <label id="mqttLog"></label>
+        <div class="status" id="status" data-state="connecting" role="status" aria-live="polite">
+            <span class="status-dot"></span>
+            <span class="status-text">Connecting</span>
+        </div>
     </div>
+</header>
+
+<main class="wrap">
+    <div class="overview">
+        <h1>Devices</h1>
+        <span class="overview-count" id="overview"></span>
+    </div>
+
+    {{ if .Rooms }}
+    <div class="rooms">
+        {{ range .Rooms }}
+        <section class="room{{ if .AnyOn }} has-on{{ end }}">
+            <div class="room-head">
+                <h2>{{ .Name }}</h2>
+                <span class="room-count">{{ .OnCount }}/{{ len .Devices }} on</span>
+            </div>
+            <ul class="devices">
+                {{ range .Devices }}
+                <li class="device{{ if .State }} is-on{{ end }}" data-device="{{ .ID }}">
+                    <span class="device-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M9 18h6M10 21h4"/>
+                            <path d="M12 3a6 6 0 0 0-3.6 10.8c.5.4.8.9.9 1.5l.1.7h5.2l.1-.7c.1-.6.4-1.1.9-1.5A6 6 0 0 0 12 3Z"/>
+                        </svg>
+                    </span>
+                    <span class="device-body">
+                        <span class="device-name">{{ .Name }}</span>
+                        <span class="device-state">{{ if .State }}On{{ else }}Off{{ end }}</span>
+                    </span>
+                    <label class="switch">
+                        <input type="checkbox" hal-device="{{ .ID }}" aria-label="{{ .Name }}"
+                               {{ if .State }}checked{{ end }}>
+                        <span class="slider"></span>
+                    </label>
+                </li>
+                {{ end }}
+            </ul>
+        </section>
+        {{ end }}
+    </div>
+    {{ else }}
+    <div class="empty">
+        <strong>No devices configured</strong>
+        <p>Add entries under <code>devices:</code> in hal.yaml and restart the service.</p>
+    </div>
+    {{ end }}
+
+    <details class="log">
+        <summary>Activity log</summary>
+        <div class="log-body" id="mqttLog"><div class="log-empty">Waiting for events…</div></div>
+    </details>
+</main>
 </body>
 </html>

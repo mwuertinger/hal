@@ -61,7 +61,17 @@ a reverse proxy in front of the unprivileged port, or
 
 ## Vendored frontend assets
 
-The Bootstrap files under `pkg/frontend/static` diverge from upstream on purpose: the
-`.map` files are not shipped and the trailing `sourceMappingURL` comments are stripped,
-keeping ~963 KB of vendor debug artifacts out of the binary. Re-apply both changes when
-upgrading Bootstrap.
+The frontend has no framework: `pkg/frontend/static` holds hand-written CSS and JS, so
+there is nothing to upgrade there. The one vendored asset is the Inter typeface
+(`static/fonts`, SIL Open Font License 1.1, license text alongside it).
+
+Both `.woff2` files are Google Fonts' own variable-weight subsets, downloaded verbatim
+from the URLs in the `@font-face` comment in `hal.css`, along with the `unicode-range`
+values that go with them. Keep the two in sync when upgrading: a range that claims
+glyphs the file does not contain renders as tofu. The split is why `latin-ext` costs
+nothing at runtime -- a page of German device names only ever fetches the 47 KB `latin`
+file.
+
+They are served from the binary rather than from `fonts.gstatic.com` because
+`hal.service` denies outbound traffic outside the LAN, so a page that reached for a CDN
+would block on the font until the browser gave up on it.
