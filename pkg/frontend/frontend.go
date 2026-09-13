@@ -471,6 +471,12 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var toLarge *http.MaxBytesError
+		if errors.As(err, &toLarge) {
+			log.Printf("body over %d bytes", toLarge.Limit)
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
+		}
 		log.Printf("reading body failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -553,6 +559,18 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	client := &wsClient{conn: conn, send: make(chan device.Event, wsSendQueue)}
 
+	// Register before starting either goroutine. The other order leaves a window
+	// where a connection that dies immediately is not yet in the map, so the
+	// reader's dropClient finds nothing to do, the queue is never closed, and the
+	// writer parks on the range for the life of the process. A broadcast landing
+	// in this window instead either buffers or takes the drop path, and a writer
+	// that then starts on an already-closed queue drains it and exits.
+	wsConnectionsMu.Lock()
+	wsConnections[client] = true
+	wsConnectionsMu.Unlock()
+
+	log.Printf("New WS: %v", conn.RemoteAddr())
+
 	// Writer. Ends when the queue is closed, or when a write fails - a stalled
 	// client hits the deadline rather than blocking here forever.
 	go func() {
@@ -588,11 +606,4 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-
-	log.Printf("New WS: %v", conn.RemoteAddr())
-
-	wsConnectionsMu.Lock()
-	defer wsConnectionsMu.Unlock()
-
-	wsConnections[client] = true
 }
