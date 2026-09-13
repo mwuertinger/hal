@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 // hashedPath matches the content-addressed URLs buildAssets produces.
@@ -36,21 +37,90 @@ func TestContentTypesArePinned(t *testing.T) {
 	}
 }
 
-// TestEveryShippedExtensionIsPinned fails here rather than at startup on the
-// target: an unpinned extension panics in buildAssets, which under
-// Restart=on-failure would restart-loop the unit.
+// TestEveryShippedExtensionIsPinned names which file is at fault. It cannot be
+// the only guard: buildAssets runs during package-variable initialisation, so an
+// unpinned extension takes the whole test binary down before any Test runs. That
+// is a fine way to fail - it fails the build - but it is not this test doing it,
+// so the rejections are tested through buildAssetsFS below instead.
 func TestEveryShippedExtensionIsPinned(t *testing.T) {
 	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
 		if _, ok := contentTypes[path.Ext(p)]; !ok {
-			t.Errorf("%s: extension %q is not pinned, so buildAssets would panic", p, path.Ext(p))
+			t.Errorf("%s: extension %q is not pinned", p, path.Ext(p))
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestBuildAssetsRejections covers the three ways the pipeline can be fed
+// something it would otherwise mangle in silence. These run against a synthetic
+// FS because the real one is built at package init, where a rejection would kill
+// the test binary rather than fail an assertion.
+func TestBuildAssetsRejections(t *testing.T) {
+	tests := []struct {
+		name    string
+		files   fstest.MapFS
+		wantErr string
+	}{
+		{
+			name: "valid",
+			files: fstest.MapFS{
+				"css/hal.css": {Data: []byte(`a{background:url("/static/img/i.svg")}`)},
+				"img/i.svg":   {Data: []byte(`<svg/>`)},
+			},
+		},
+		{
+			// The case longest-first sorting cannot save, and the one a previous
+			// round argued was a false positive: hashing hal.css.map leaves
+			// /static/css/hal.css intact inside the result.
+			name: "one logical path is another plus a suffix",
+			files: fstest.MapFS{
+				"css/hal.css":     {Data: []byte(`a{}`)},
+				"css/hal.css.map": {Data: []byte(`{}`)},
+			},
+			wantErr: `is a prefix of`,
+		},
+		{
+			name: "a non-stylesheet references an asset",
+			files: fstest.MapFS{
+				"js/hal.js": {Data: []byte(`fetch("/static/img/i.svg")`)},
+				"img/i.svg": {Data: []byte(`<svg/>`)},
+			},
+			wantErr: "is not a stylesheet",
+		},
+		{
+			name:    "an extension is not pinned",
+			files:   fstest.MapFS{"img/note.xyz": {Data: []byte("x")}},
+			wantErr: "no content type pinned",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := buildAssetsFS(tt.files)
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("buildAssetsFS() = %v, want nil", err)
+				}
+				css := string(out["css/hal.css"].content)
+				if strings.Contains(css, `"/static/img/i.svg"`) {
+					t.Errorf("stylesheet reference was left unhashed: %s", css)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("buildAssetsFS() = nil, want an error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("buildAssetsFS() = %q, want an error containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -94,8 +164,11 @@ func TestStylesheetReferencesAreHashed(t *testing.T) {
 	}
 }
 
-// TestRewriteAssetRefsPrefers the longest match: a logical path that is a prefix
-// of another must not be substituted inside it.
+// TestRewriteAssetRefsPrefersLongestMatch checks that a shared stem does not make
+// the shorter path win. This pair is safe by construction - the hash lands ahead
+// of the single extension either way - so it only guards the sort order. The
+// genuinely dangerous shape, one path being another plus a suffix, is rejected by
+// buildAssetsFS instead, because no sort order can rewrite it correctly.
 func TestRewriteAssetRefsPrefersLongestMatch(t *testing.T) {
 	built := map[string]*staticAsset{
 		"img/a.svg":  {publicPath: "/static/img/a.SHORT.svg"},

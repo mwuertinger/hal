@@ -118,10 +118,13 @@
     // longer the one we started from.
     var inFlight = Object.create(null);
 
-    // Bumped whenever something authoritative is applied to a device. A resync
-    // compares this against the value it captured before its request went out, so
-    // a snapshot that was already stale when it arrived cannot overwrite a newer
-    // fact. See resync().
+    // Per device, a counter of everything that has changed what the page believes
+    // since it loaded - an authoritative event, or the user's own tap. A resync
+    // compares it against the value captured before its request went out, so a
+    // snapshot that was already stale on arrival cannot overwrite a newer fact.
+    // It is not monotonic: a burst of taps that all failed winds its own bumps
+    // back off, because a tap that achieved nothing taught the page nothing. That
+    // is why applyStates compares for inequality rather than for a newer value.
     var epoch = Object.create(null);
 
     // One promise chain per device, so two taps cannot race each other to the
@@ -395,7 +398,9 @@
             }
 
             var name = row ? row.querySelector(".device-name").textContent : event.DeviceId;
-            log(name + " → " + (state ? "on" : "off"), event.Timestamp);
+            // "->" rather than an arrow glyph: U+2192 is outside both Inter
+            // subsets, so it would render from the fallback stack on every line.
+            log(name + " -> " + (state ? "on" : "off"), event.Timestamp);
         };
 
         socket.onclose = function () {

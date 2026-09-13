@@ -96,13 +96,9 @@ func init() {
 // which a test catches long before a deploy does.
 var contentTypes = map[string]string{
 	".css":   "text/css; charset=utf-8",
-	".ico":   "image/vnd.microsoft.icon",
 	".js":    "text/javascript; charset=utf-8",
-	".json":  "application/json",
-	".png":   "image/png",
 	".svg":   "image/svg+xml",
 	".txt":   "text/plain; charset=utf-8",
-	".woff":  "font/woff",
 	".woff2": "font/woff2",
 }
 
@@ -130,8 +126,21 @@ type staticAsset struct {
 // seen, so a poisoned cache heals on its own, and an unchanged build keeps its
 // URL, so the response can be marked immutable and skip revalidation entirely.
 func buildAssets() map[string]*staticAsset {
+	out, err := buildAssetsFS(staticFiles)
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// buildAssetsFS is the fallible half, split out so its rejections can be tested.
+// buildAssets runs during package-variable initialisation, so anything it panics
+// on takes the test binary down before a single Test function runs - which makes
+// an assertion about a rejection unreachable if it can only be written against
+// the embedded FS.
+func buildAssetsFS(fsys fs.FS) (map[string]*staticAsset, error) {
 	var paths []string
-	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -139,7 +148,23 @@ func buildAssets() map[string]*staticAsset {
 		return nil
 	})
 	if err != nil {
-		panic(err)
+		return nil, err
+	}
+
+	// A logical path that is a prefix of another corrupts the longer one's
+	// rewritten URL, and sorting longest-first does not save it: hashing
+	// css/hal.css.map yields /static/css/hal.css.<hash>.map, which still
+	// contains /static/css/hal.css, so the second substitution eats it. The
+	// affected shape is one path being another plus a suffix - hal.css against
+	// hal.css.map or hal.css.gz - and not, as it looks, any shared stem:
+	// inter-latin.woff against inter-latin.woff2 is fine, because there the hash
+	// lands ahead of the single extension.
+	for _, a := range paths {
+		for _, b := range paths {
+			if a != b && strings.HasPrefix(b, a) {
+				return nil, fmt.Errorf("static asset %q is a prefix of %q: rewriting url() references would corrupt the longer one", a, b)
+			}
+		}
 	}
 
 	// Stylesheets last: they refer to other assets by URL, so those must already
@@ -154,25 +179,27 @@ func buildAssets() map[string]*staticAsset {
 
 	out := make(map[string]*staticAsset, len(paths))
 	for _, p := range paths {
-		content := must(fs.ReadFile(staticFiles, p))
-		if path.Ext(p) == ".css" {
+		content, err := fs.ReadFile(fsys, p)
+		if err != nil {
+			return nil, err
+		}
+		ext := path.Ext(p)
+
+		if ext == ".css" {
 			content = rewriteAssetRefs(content, out)
+		} else if bytes.Contains(content, []byte("/static/")) {
+			// Only stylesheets get their references rewritten, so anything else
+			// naming an asset would silently keep an unhashed URL and 404.
+			return nil, fmt.Errorf("static asset %q references /static/ but is not a stylesheet, so its URLs are never rewritten", p)
 		}
 
-		// Only stylesheets get their references rewritten, so anything else that
-		// names an asset would silently keep an unhashed URL and 404.
-		if path.Ext(p) != ".css" && bytes.Contains(content, []byte("/static/")) {
-			panic(fmt.Sprintf("static asset %q references /static/ but is not a stylesheet, so its URLs are never rewritten", p))
+		contentType, ok := contentTypes[ext]
+		if !ok {
+			return nil, fmt.Errorf("no content type pinned for %q; add %q to contentTypes", p, ext)
 		}
 
 		sum := sha256.Sum256(content)
 		hash := hex.EncodeToString(sum[:])[:16]
-		ext := path.Ext(p)
-
-		contentType, ok := contentTypes[ext]
-		if !ok {
-			panic(fmt.Sprintf("no content type pinned for %q; add %q to contentTypes", p, ext))
-		}
 
 		out[p] = &staticAsset{
 			publicPath:  "/static/" + strings.TrimSuffix(p, ext) + "." + hash + ext,
@@ -181,7 +208,7 @@ func buildAssets() map[string]*staticAsset {
 			etag:        `"` + hash + `"`,
 		}
 	}
-	return out
+	return out, nil
 }
 
 // rewriteAssetRefs points a stylesheet's url() references at the hashed paths of
@@ -192,9 +219,10 @@ func rewriteAssetRefs(content []byte, built map[string]*staticAsset) []byte {
 	for logical := range built {
 		logicals = append(logicals, logical)
 	}
-	// Longest first, so a path that is a prefix of another cannot be substituted
-	// inside it. buildAssets rejects that case outright; this keeps the rewrite
-	// order-independent regardless.
+	// Longest first, so the rewrite does not depend on map iteration order.
+	// buildAssetsFS has already rejected the case this cannot handle - a path
+	// that is another plus a suffix - because longest-first does not save that
+	// one; see the check there.
 	sort.Slice(logicals, func(i, j int) bool { return len(logicals[i]) > len(logicals[j]) })
 
 	for _, logical := range logicals {
@@ -253,7 +281,7 @@ func Start(httpConfig config.Http) error {
 		return errors.New("already started")
 	}
 
-	wsConnections = make(map[*websocket.Conn]bool)
+	wsConnections = make(map[*wsClient]bool)
 
 	shutdown = make(chan interface{})
 	wg.Add(1)
@@ -270,19 +298,22 @@ func Start(httpConfig config.Http) error {
 
 				log.Printf("New event: %v", event)
 
+				// Hand each client its event and move on. Writing here instead
+				// would make one unresponsive client everyone's problem: this
+				// goroutine is the only reader of device.Events(), and a write
+				// that blocks stops it draining, which backs up into
+				// processNotification while that holds the device lock - the
+				// same lock homeHandler and stateHandler need. Bounding the
+				// write only capped that at wsWriteTimeout per stalled client;
+				// not blocking at all removes it.
 				wsConnectionsMu.Lock()
 				for c := range wsConnections {
-					// Bound every write. A suspended phone sends no RST, so
-					// without this a single unresponsive client makes the whole
-					// dashboard unresponsive for everyone until the kernel gives
-					// up on the connection minutes later.
-					if err := c.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
-						log.Printf("WS %v: SetWriteDeadline: %v", c.RemoteAddr(), err)
-					}
-					if err := c.WriteJSON(event); err != nil {
-						log.Printf("WS %v: WriteJSON: %v, dropping", c.RemoteAddr(), err)
+					select {
+					case c.send <- event:
+					default:
+						log.Printf("WS %v: %d events behind, dropping", c.conn.RemoteAddr(), wsSendQueue)
 						delete(wsConnections, c)
-						c.Close()
+						close(c.send)
 					}
 				}
 				wsConnectionsMu.Unlock()
@@ -292,9 +323,12 @@ func Start(httpConfig config.Http) error {
 		}
 
 	shutdown:
+		// Closing the queue ends each writer, and each writer closes its own
+		// connection - so nothing here has to wait on a socket.
 		wsConnectionsMu.Lock()
 		for c := range wsConnections {
-			c.Close()
+			delete(wsConnections, c)
+			close(c.send)
 		}
 		wsConnectionsMu.Unlock()
 		log.Printf("frontend: shutdown complete")
@@ -302,7 +336,7 @@ func Start(httpConfig config.Http) error {
 	}()
 
 	r := mux.NewRouter()
-	r.HandleFunc("/", homeHandler).Methods("GET")
+	r.HandleFunc("/", homeHandler).Methods("GET", "HEAD")
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", staticHandler()))
 	r.HandleFunc("/api/state", stateHandler).Methods("GET")
 	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
@@ -431,6 +465,10 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 func switchHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
+	// The body is "true" or "false". ReadTimeout bounds how long a client may
+	// take to send one, but nothing bounded how much it could send.
+	r.Body = http.MaxBytesReader(w, r.Body, 64)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("reading body failed: %v", err)
@@ -475,10 +513,35 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// wsSendQueue is how far one client may fall behind before it is dropped.
+// Generous next to the handful of events a lamp produces, and small enough that
+// a client that has genuinely stopped reading is recognised quickly.
+const wsSendQueue = 64
+
+// wsClient is one browser: its connection plus the queue feeding it. Only the
+// client's own writer goroutine touches the connection for writing, which is
+// what gorilla requires.
+type wsClient struct {
+	conn *websocket.Conn
+	send chan device.Event
+}
+
 var (
-	wsConnections   map[*websocket.Conn]bool
-	wsConnectionsMu sync.RWMutex
+	wsConnections   map[*wsClient]bool
+	wsConnectionsMu sync.Mutex
 )
+
+// dropClient removes a client and closes its queue, which is what ends its
+// writer. Closing the queue is guarded by the client still being registered, so
+// it happens exactly once however many goroutines notice the failure.
+func dropClient(c *wsClient) {
+	wsConnectionsMu.Lock()
+	defer wsConnectionsMu.Unlock()
+	if wsConnections[c] {
+		delete(wsConnections, c)
+		close(c.send)
+	}
+}
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Upgrade(w, r, nil, 1024, 1024)
@@ -488,20 +551,38 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	client := &wsClient{conn: conn, send: make(chan device.Event, wsSendQueue)}
+
+	// Writer. Ends when the queue is closed, or when a write fails - a stalled
+	// client hits the deadline rather than blocking here forever.
+	go func() {
+		for event := range client.send {
+			if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+				log.Printf("WS %v: SetWriteDeadline: %v", conn.RemoteAddr(), err)
+			}
+			if err := conn.WriteJSON(event); err != nil {
+				log.Printf("WS %v: WriteJSON: %v, dropping", conn.RemoteAddr(), err)
+				break
+			}
+		}
+
+		dropClient(client)
+
+		// Nothing else closes the hijacked connection. Leaving it open leaks a
+		// file descriptor per disconnect - against LimitNOFILE=1024 in
+		// hal.service - and strands a client that closed cleanly in CLOSING,
+		// still waiting for the server half of the handshake, so its onclose
+		// never fires and it never reconnects.
+		conn.Close()
+	}()
+
+	// Reader. The page never sends anything, so this exists to notice the
+	// connection going away.
 	go func() {
 		for {
-			_, _, err := conn.ReadMessage()
-			if err != nil {
+			if _, _, err := conn.ReadMessage(); err != nil {
 				log.Printf("ReadMessage() error: %v, Removing WS: %v", err, conn.RemoteAddr())
-				wsConnectionsMu.Lock()
-				delete(wsConnections, conn)
-				wsConnectionsMu.Unlock()
-
-				// Nothing else closes the hijacked connection. Leaving it open
-				// leaks a file descriptor per disconnect - against LimitNOFILE=1024
-				// in hal.service - and strands a client that closed cleanly in
-				// CLOSING, still waiting for the server half of the handshake, so
-				// its onclose never fires and it never reconnects.
+				dropClient(client)
 				conn.Close()
 				return
 			}
@@ -513,5 +594,5 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	wsConnectionsMu.Lock()
 	defer wsConnectionsMu.Unlock()
 
-	wsConnections[conn] = true
+	wsConnections[client] = true
 }
