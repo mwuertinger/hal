@@ -1,5 +1,11 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffb340"
-     stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-width="2.1"
+     stroke-linecap="round" stroke-linejoin="round">
+  <style>
+    /* Matches --on in hal.css. The darker light-mode value keeps the mark legible
+       against the white tab strip; the lighter one is for dark browser chrome. */
+    :root { stroke: #e8890c; }
+    @media (prefers-color-scheme: dark) { :root { stroke: #ffb340; } }
+  </style>
   <path d="M9 18h6M10 21h4"/>
   <path d="M12 3a6 6 0 0 0-3.6 10.8c.5.4.8.9.9 1.5l.1.7h5.2l.1-.7c.1-.6.4-1.1.9-1.5A6 6 0 0 0 12 3Z"/>
 </svg>

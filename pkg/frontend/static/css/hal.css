@@ -48,8 +48,12 @@
     --text-faint: #8b949e;
     --on: #e8890c;
     --on-soft: rgba(232, 137, 12, 0.12);
+    --on-halo: rgba(232, 137, 12, 0.45);
+    --on-edge: rgba(232, 137, 12, 0.35);
     --live: #1a9c5b;
+    --live-halo: rgba(26, 156, 91, 0.22);
     --down: #d1453b;
+    --down-halo: rgba(209, 69, 59, 0.22);
     --shadow: 0 1px 2px rgba(16, 20, 26, 0.06), 0 6px 20px -12px rgba(16, 20, 26, 0.3);
     --radius: 14px;
 }
@@ -89,15 +93,16 @@ body {
     font-size: 16px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
-    /* Keep content clear of the notch and the home indicator on phones. */
-    padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
+/* Keep content clear of the notch and the rounded corners in landscape. The insets
+   go here rather than on body so that the sticky bar's background still reaches the
+   edges of the screen. */
 .wrap {
     width: 100%;
     max-width: 1040px;
     margin: 0 auto;
-    padding: 0 16px;
+    padding: 0 calc(16px + env(safe-area-inset-right)) 0 calc(16px + env(safe-area-inset-left));
 }
 
 /* --- Top bar ------------------------------------------------------------- */
@@ -106,7 +111,11 @@ body {
     position: sticky;
     top: 0;
     z-index: 10;
+    /* Opaque first: where color-mix() is unsupported the whole declaration is
+       dropped, and a transparent sticky bar has page content scrolling through it. */
+    background: var(--bg-accent);
     background: color-mix(in srgb, var(--bg-accent) 85%, transparent);
+    -webkit-backdrop-filter: saturate(160%) blur(12px);
     backdrop-filter: saturate(160%) blur(12px);
     border-bottom: 1px solid var(--border);
     padding-top: env(safe-area-inset-top);
@@ -181,16 +190,22 @@ body {
 
 .status[data-state="live"] .status-dot {
     background: var(--live);
+    box-shadow: 0 0 0 3px var(--live-halo);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--live) 22%, transparent);
 }
 
 .status[data-state="down"] .status-dot {
     background: var(--down);
+    box-shadow: 0 0 0 3px var(--down-halo);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--down) 22%, transparent);
 }
 
 .status[data-state="connecting"] .status-dot {
     background: var(--on);
+}
+
+.status[data-state="connecting"] .status-dot,
+.status[data-state="down"] .status-dot {
     animation: pulse 1.4s ease-in-out infinite;
 }
 
@@ -287,8 +302,9 @@ main {
     display: flex;
     align-items: center;
     gap: 13px;
-    padding: 11px 16px;
-    min-height: 62px;
+    /* The extra 8px on the right cancels the switch's negative margin, so the
+       switch ends up as far from the card edge as the icon is on the left. */
+    padding: 11px 24px 11px 16px;
     border-top: 1px solid var(--border);
     transition: background-color 0.2s ease;
 }
@@ -318,6 +334,7 @@ main {
 .device.is-on .device-icon {
     color: var(--on);
     background: var(--on-soft);
+    border-color: var(--on-edge);
     border-color: color-mix(in srgb, var(--on) 35%, transparent);
 }
 
@@ -344,11 +361,6 @@ main {
 
 .device.is-on .device-state {
     color: var(--on);
-}
-
-.device.is-pending .device-state {
-    color: var(--text-dim);
-    font-style: italic;
 }
 
 /* --- Toggle -------------------------------------------------------------- */
@@ -404,11 +416,11 @@ input:checked + .slider::before {
 }
 
 input:focus-visible + .slider {
+    box-shadow: 0 0 0 3px var(--on-halo);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--on) 45%, transparent);
 }
 
-input:disabled + .slider {
-    opacity: 0.55;
+.device.is-pending .slider {
     cursor: progress;
 }
 
@@ -517,8 +529,7 @@ input:disabled + .slider {
     }
 
     .device {
-        padding: 11px 14px;
-        min-height: 66px;
+        padding: 11px 22px 11px 14px;
     }
 
     .brand-sub {

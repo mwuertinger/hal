@@ -15,7 +15,14 @@
             return;
         }
         statusEl.dataset.state = state;
-        statusEl.querySelector(".status-text").textContent = text;
+
+        // role="status" announces the whole region on every mutation, and a
+        // flapping connection would otherwise re-announce "Reconnecting" on each
+        // backoff step. Only touch the text when it actually changes.
+        var textEl = statusEl.querySelector(".status-text");
+        if (textEl.textContent !== text) {
+            textEl.textContent = text;
+        }
     }
 
     // --- Device rows -------------------------------------------------------
@@ -67,6 +74,16 @@
 
     // --- Switching ---------------------------------------------------------
 
+    // One token per device while a PUT is in flight. Anything that learns the real
+    // state in the meantime - a websocket event, a resync - drops the token, which
+    // is what stops a late failure from reverting to a state that is no longer the
+    // one we started from.
+    var inFlight = Object.create(null);
+
+    function supersede(id) {
+        delete inFlight[id];
+    }
+
     document.addEventListener("change", function (event) {
         var input = event.target;
         if (!input.matches || !input.matches("input[hal-device]")) {
@@ -74,15 +91,18 @@
         }
 
         var row = input.closest(".device");
+        var id = input.getAttribute("hal-device");
         var target = input.checked;
+        var token = {};
+
+        inFlight[id] = token;
 
         // Show the new state right away, then correct it if the request fails:
         // waiting for the broker to echo it back makes the switch feel broken.
         paint(row, target);
         row.classList.add("is-pending");
-        input.disabled = true;
 
-        fetch("/api/" + encodeURIComponent(input.getAttribute("hal-device")), {
+        fetch("/api/" + encodeURIComponent(id), {
             method: "PUT",
             body: target ? "true" : "false"
         }).then(function (response) {
@@ -93,11 +113,21 @@
             // the body stream and log an aborted request for every toggle.
             return response.text();
         }).catch(function (err) {
+            var name = row.querySelector(".device-name").textContent;
+            log(name + ": switch failed, " + err.message);
+
+            // Only undo our own optimistic paint. If something already told us the
+            // real state, or the user has since clicked again, that is the truth
+            // now and this stale response must not overwrite it.
+            if (inFlight[id] !== token) {
+                return;
+            }
             input.checked = !target;
             paint(row, !target);
-            log("switch failed: " + err.message);
         }).finally(function () {
-            input.disabled = false;
+            if (inFlight[id] === token) {
+                delete inFlight[id];
+            }
             row.classList.remove("is-pending");
         });
     });
@@ -124,7 +154,13 @@
         entry.appendChild(time);
         entry.appendChild(document.createTextNode(text));
 
-        var atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 4;
+        // While the panel is collapsed, engines that hide it with display:none
+        // report every metric as zero. Pinning on those numbers scrolls the log to
+        // the top and then wedges it there, because from that point on the
+        // at-bottom test can never be true again. Skip the pin and do it on open.
+        var measurable = logEl.clientHeight > 0;
+        var atBottom = measurable && logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 4;
+
         logEl.appendChild(entry);
 
         while (logEl.children.length > LOG_LIMIT) {
@@ -133,6 +169,42 @@
         if (atBottom) {
             logEl.scrollTop = logEl.scrollHeight;
         }
+    }
+
+    var logDetails = document.querySelector(".log");
+    if (logDetails) {
+        logDetails.addEventListener("toggle", function () {
+            if (logDetails.open) {
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+        });
+    }
+
+    // --- Resync -------------------------------------------------------------
+
+    // The template renders the state as it was when the page was built, and the
+    // websocket only carries changes from the moment it is open. Everything in
+    // between - the gap before the socket connects, and the whole of any outage -
+    // is invisible to the page, so refetch the truth whenever the socket comes up.
+    function resync() {
+        return fetch("/api/state").then(function (response) {
+            if (!response.ok) {
+                throw new Error("HTTP " + response.status);
+            }
+            return response.json();
+        }).then(function (states) {
+            Object.keys(states).forEach(function (id) {
+                var row = rowFor(id);
+                if (!row || id in inFlight) {
+                    return;
+                }
+                var state = !!states[id];
+                row.querySelector("input[hal-device]").checked = state;
+                paint(row, state);
+            });
+        }).catch(function (err) {
+            log("could not read device state: " + err.message);
+        });
     }
 
     // --- Websocket ---------------------------------------------------------
@@ -146,6 +218,7 @@
         socket.onopen = function () {
             retry = 0;
             setStatus("live", "Live");
+            resync();
         };
 
         socket.onmessage = function (message) {
@@ -156,6 +229,8 @@
                 log("unparseable event: " + message.data);
                 return;
             }
+
+            supersede(event.DeviceId);
 
             var row = rowFor(event.DeviceId);
             if (row) {

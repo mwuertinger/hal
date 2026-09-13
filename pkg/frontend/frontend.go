@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -43,11 +44,6 @@ var (
 	staticETags   = buildStaticETags()
 )
 
-// buildStaticETags derives an ETag from the content of every embedded static asset. embed.FS
-// reports a zero ModTime, which makes http.FileServer omit Last-Modified and therefore skip
-// conditional requests altogether; without a validator of our own every page load would
-// re-transfer all assets. Hashing the content rather than stamping a build time also keeps the
-// validator honest across upgrades: the ETag changes exactly when the bytes do.
 func init() {
 	// Go's built-in table has no entry for .woff2 and otherwise falls back to
 	// /etc/mime.types, which comes from a package (media-types) that need not be
@@ -58,6 +54,11 @@ func init() {
 	}
 }
 
+// buildStaticETags derives an ETag from the content of every embedded static asset. embed.FS
+// reports a zero ModTime, which makes http.FileServer omit Last-Modified and therefore skip
+// conditional requests altogether; without a validator of our own every page load would
+// re-transfer all assets. Hashing the content rather than stamping a build time also keeps the
+// validator honest across upgrades: the ETag changes exactly when the bytes do.
 func buildStaticETags() map[string]string {
 	etags := make(map[string]string)
 	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
@@ -84,10 +85,15 @@ func buildStaticETags() map[string]string {
 func staticHandler() http.Handler {
 	fileServer := http.FileServer(http.FS(staticFiles))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if etag, ok := staticETags[path.Clean("/"+r.URL.Path)]; ok {
-			w.Header().Set("ETag", etag)
-			w.Header().Set("Cache-Control", "public, no-cache")
+		etag, isFile := staticETags[path.Clean("/"+r.URL.Path)]
+		if !isFile {
+			// Every path that is not one of the embedded files is either a
+			// directory, which http.FileServer would happily index, or absent.
+			http.NotFound(w, r)
+			return
 		}
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "public, no-cache")
 		fileServer.ServeHTTP(w, r)
 	})
 }
@@ -150,6 +156,7 @@ func Start(httpConfig config.Http) error {
 	r := mux.NewRouter()
 	r.HandleFunc("/", homeHandler).Methods("GET")
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", staticHandler()))
+	r.HandleFunc("/api/state", stateHandler).Methods("GET")
 	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
 	r.HandleFunc("/api/ws", wsHandler)
 
@@ -199,7 +206,9 @@ type frontendDevice struct {
 }
 
 type homePage struct {
-	Rooms []frontendRoom
+	Rooms   []frontendRoom
+	OnCount int
+	Total   int
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
@@ -233,13 +242,34 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		return frontendRooms[i].Name < frontendRooms[j].Name
 	})
 
+	page := homePage{Rooms: frontendRooms}
+	for _, room := range frontendRooms {
+		page.OnCount += room.OnCount
+		page.Total += len(room.Devices)
+	}
+
 	w.WriteHeader(200)
-	err := indexTemplate.Execute(w, &homePage{
-		Rooms: frontendRooms,
-	})
+	err := indexTemplate.Execute(w, &page)
 
 	if err != nil {
 		log.Printf("unable to execute template: %v", err)
+	}
+}
+
+// stateHandler reports the last known state of every switch. The page renders its
+// initial state from the template, but a websocket that drops loses every event for
+// as long as it is down, so the client refetches this whenever it (re)connects.
+func stateHandler(w http.ResponseWriter, r *http.Request) {
+	states := make(map[string]bool)
+	for _, d := range device.List() {
+		if switchDev, ok := d.(device.Switch); ok {
+			states[d.ID()] = switchDev.LastKnownState()
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(states); err != nil {
+		log.Printf("unable to encode state: %v", err)
 	}
 }
 
@@ -311,6 +341,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				wsConnectionsMu.Lock()
 				delete(wsConnections, conn)
 				wsConnectionsMu.Unlock()
+
+				// Nothing else closes the hijacked connection. Leaving it open
+				// leaks a file descriptor per disconnect - against LimitNOFILE=1024
+				// in hal.service - and strands a client that closed cleanly in
+				// CLOSING, still waiting for the server half of the handshake, so
+				// its onclose never fires and it never reconnects.
+				conn.Close()
 				return
 			}
 		}

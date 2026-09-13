@@ -28,7 +28,7 @@
                 <span class="brand-sub">Home Automation Link</span>
             </span>
         </div>
-        <div class="status" id="status" data-state="connecting" role="status" aria-live="polite">
+        <div class="status" id="status" data-state="connecting" role="status">
             <span class="status-dot"></span>
             <span class="status-text">Connecting</span>
         </div>
@@ -38,7 +38,7 @@
 <main class="wrap">
     <div class="overview">
         <h1>Devices</h1>
-        <span class="overview-count" id="overview"></span>
+        <span class="overview-count" id="overview">{{ if .Total }}<b>{{ .OnCount }}</b> of {{ .Total }} on{{ end }}</span>
     </div>
 
     {{ if .Rooms }}
@@ -49,7 +49,7 @@
                 <h2>{{ .Name }}</h2>
                 <span class="room-count">{{ .OnCount }}/{{ len .Devices }} on</span>
             </div>
-            <ul class="devices">
+            <ul class="devices" role="list">
                 {{ range .Devices }}
                 <li class="device{{ if .State }} is-on{{ end }}" data-device="{{ .ID }}">
                     <span class="device-icon">
