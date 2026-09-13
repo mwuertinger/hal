@@ -1,70 +1,558 @@
-h1 {
-    padding-top: 10px;
+/* ---------------------------------------------------------------------------
+   HAL frontend styles.
+
+   Self-contained on purpose: no framework, and the webfont below is served from
+   the binary rather than from fonts.gstatic.com. hal.service denies outbound
+   traffic to anything outside the LAN, so a page that reached for a CDN would
+   block on the font until the browser gave up on it.
+   --------------------------------------------------------------------------- */
+
+/* Inter, SIL Open Font License 1.1 - LICENSE.txt sits next to the files. These are
+   Google Fonts' own variable-weight subsets, downloaded verbatim; the
+   unicode-range split is theirs too, so a page of German device names only ever
+   pulls the 47 KB latin file and leaves latin-ext on disk. Refresh both from
+   https://fonts.googleapis.com/css2?family=Inter:wght@400..700 when upgrading. */
+@font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 400 700;
+    font-display: swap;
+    src: url("/static/fonts/inter-latin.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+        U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+        U+FEFF, U+FFFD;
 }
 
-h2 {
-    padding-top: 20px;
+@font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 400 700;
+    font-display: swap;
+    src: url("/static/fonts/inter-latin-ext.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304,
+        U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0,
+        U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
-/* The switch - the box around the slider */
+:root {
+    color-scheme: light dark;
+
+    --bg: #f2f3f5;
+    --bg-accent: #e8eaee;
+    --surface: #ffffff;
+    --surface-sunken: #f7f8fa;
+    --border: #e2e5ea;
+    --border-strong: #d3d8e0;
+    --text: #16191d;
+    --text-dim: #626b76;
+    --text-faint: #8b949e;
+    --on: #e8890c;
+    --on-soft: rgba(232, 137, 12, 0.12);
+    --on-halo: rgba(232, 137, 12, 0.45);
+    --on-edge: rgba(232, 137, 12, 0.35);
+    --live: #1a9c5b;
+    --live-halo: rgba(26, 156, 91, 0.22);
+    --down: #d1453b;
+    --down-halo: rgba(209, 69, 59, 0.22);
+    --shadow: 0 1px 2px rgba(16, 20, 26, 0.06), 0 6px 20px -12px rgba(16, 20, 26, 0.3);
+    --radius: 14px;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #0d1117;
+        --bg-accent: #11161d;
+        --surface: #161b22;
+        --surface-sunken: #10151b;
+        --border: #232a33;
+        --border-strong: #313a45;
+        --text: #e6edf3;
+        --text-dim: #9aa4b0;
+        --text-faint: #6e7781;
+        --on: #ffb340;
+        --on-soft: rgba(255, 179, 64, 0.14);
+        --on-halo: rgba(255, 179, 64, 0.45);
+        --on-edge: rgba(255, 179, 64, 0.35);
+        --live: #3fb950;
+        --live-halo: rgba(63, 185, 80, 0.22);
+        --down: #f85149;
+        --down-halo: rgba(248, 81, 73, 0.22);
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -16px rgba(0, 0, 0, 0.8);
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    /* Only the bottom inset belongs on body. The left and right ones live on
+       .wrap so that the sticky bar's background still reaches the screen edges
+       in landscape. */
+    padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* Keep content clear of the notch and the rounded corners in landscape. The insets
+   go here rather than on body so that the sticky bar's background still reaches the
+   edges of the screen. */
+/* Longhands, not a shorthand: .wrap outranks main, and a shorthand here would
+   reset main's vertical padding to zero. */
+.wrap {
+    width: 100%;
+    max-width: 1040px;
+    margin: 0 auto;
+    padding-right: calc(16px + env(safe-area-inset-right));
+    padding-left: calc(16px + env(safe-area-inset-left));
+}
+
+/* --- Top bar ------------------------------------------------------------- */
+
+.topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    /* Opaque first: where color-mix() is unsupported the whole declaration is
+       dropped, and a transparent sticky bar has page content scrolling through it. */
+    background: var(--bg-accent);
+    background: color-mix(in srgb, var(--bg-accent) 85%, transparent);
+    -webkit-backdrop-filter: saturate(160%) blur(12px);
+    backdrop-filter: saturate(160%) blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding-top: env(safe-area-inset-top);
+}
+
+.topbar-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 60px;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    min-width: 0;
+}
+
+.brand-mark {
+    flex: none;
+    width: 30px;
+    height: 30px;
+    color: var(--on);
+}
+
+.brand-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.brand-name {
+    font-size: 1.05rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    line-height: 1.15;
+}
+
+.brand-sub {
+    font-size: 0.75rem;
+    color: var(--text-faint);
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.status {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    flex: none;
+    padding: 5px 11px 5px 9px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    font-size: 0.78rem;
+    font-weight: 550;
+    color: var(--text-dim);
+    white-space: nowrap;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-faint);
+    transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.status[data-state="live"] .status-dot {
+    background: var(--live);
+    box-shadow: 0 0 0 3px var(--live-halo);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--live) 22%, transparent);
+}
+
+.status[data-state="down"] .status-dot {
+    background: var(--down);
+    box-shadow: 0 0 0 3px var(--down-halo);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--down) 22%, transparent);
+}
+
+.status[data-state="connecting"] .status-dot {
+    background: var(--on);
+}
+
+.status[data-state="connecting"] .status-dot,
+.status[data-state="down"] .status-dot {
+    animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+}
+
+/* --- Overview ------------------------------------------------------------ */
+
+main {
+    padding: 22px 0 40px;
+}
+
+.overview {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 0 0 18px;
+}
+
+.overview h1 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 680;
+    letter-spacing: -0.02em;
+}
+
+.overview-count {
+    font-size: 0.9rem;
+    color: var(--text-dim);
+}
+
+.overview-count b {
+    color: var(--on);
+    font-weight: 650;
+}
+
+/* --- Rooms --------------------------------------------------------------- */
+
+/* Multi-column rather than grid so that a room with three devices does not
+   stretch a whole grid row and leave the one-device rooms floating in a gap. */
+.rooms {
+    columns: 320px;
+    column-gap: 16px;
+}
+
+.room {
+    break-inside: avoid;
+    margin-bottom: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+.room-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 13px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-sunken);
+}
+
+.room-head h2 {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 640;
+    letter-spacing: 0.01em;
+}
+
+.room-count {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+}
+
+.room.has-on .room-count {
+    color: var(--on);
+}
+
+.devices {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.device {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    /* The extra 8px on the right cancels the switch's negative margin, so the
+       switch ends up as far from the card edge as the icon is on the left. */
+    padding: 11px 24px 11px 16px;
+    border-top: 1px solid var(--border);
+    transition: background-color 0.2s ease;
+}
+
+.device:first-child {
+    border-top: none;
+}
+
+.device-icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    background: var(--surface-sunken);
+    border: 1px solid var(--border);
+    color: var(--text-faint);
+    transition: color 0.25s ease, background-color 0.25s ease, border-color 0.25s ease;
+}
+
+.device-icon svg {
+    width: 20px;
+    height: 20px;
+}
+
+.device.is-on .device-icon {
+    color: var(--on);
+    background: var(--on-soft);
+    border-color: var(--on-edge);
+    border-color: color-mix(in srgb, var(--on) 35%, transparent);
+}
+
+.device-body {
+    flex: 1;
+    min-width: 0;
+}
+
+.device-name {
+    display: block;
+    font-weight: 560;
+    letter-spacing: -0.005em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.device-state {
+    display: block;
+    font-size: 0.78rem;
+    color: var(--text-faint);
+    transition: color 0.2s ease;
+}
+
+.device.is-on .device-state {
+    color: var(--on);
+}
+
+/* --- Toggle -------------------------------------------------------------- */
+
+/* The visible switch is 52x31; the 8px padding widens the touch target to
+   68x47 without moving anything, and the negative margin keeps it out of the
+   row's own spacing. */
 .switch {
+    flex: none;
     position: relative;
     display: inline-block;
-    width: 60px;
-    height: 34px;
+    width: 68px;
+    height: 47px;
+    padding: 8px;
+    margin: -8px;
 }
 
-/* Hide default HTML checkbox */
 .switch input {
+    position: absolute;
     opacity: 0;
     width: 0;
     height: 0;
 }
 
-/* The slider */
 .slider {
     position: absolute;
+    inset: 8px;
     cursor: pointer;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-color: #ccc;
-    -webkit-transition: .4s;
-    transition: .4s;
+    background: var(--border-strong);
+    border-radius: 999px;
+    transition: background-color 0.25s ease, box-shadow 0.2s ease;
 }
 
-.slider:before {
-    position: absolute;
+.slider::before {
     content: "";
-    height: 26px;
-    width: 26px;
-    left: 4px;
-    bottom: 4px;
-    background-color: white;
-    -webkit-transition: .4s;
-    transition: .4s;
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 25px;
+    height: 25px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+    transition: transform 0.25s cubic-bezier(0.3, 1.4, 0.6, 1);
 }
 
 input:checked + .slider {
-    background-color: #2196F3;
+    background: var(--on);
 }
 
-input:focus + .slider {
-    box-shadow: 0 0 1px #2196F3;
+input:checked + .slider::before {
+    transform: translateX(21px);
 }
 
-input:checked + .slider:before {
-    -webkit-transform: translateX(26px);
-    -ms-transform: translateX(26px);
-    transform: translateX(26px);
+input:focus-visible + .slider {
+    box-shadow: 0 0 0 3px var(--on-halo);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--on) 45%, transparent);
 }
 
-/* Rounded sliders */
-.slider.round {
-    border-radius: 34px;
+.device.is-pending .slider {
+    cursor: progress;
 }
 
-.slider.round:before {
-    border-radius: 50%;
+/* --- Empty state --------------------------------------------------------- */
+
+.empty {
+    padding: 44px 20px;
+    text-align: center;
+    color: var(--text-dim);
+    background: var(--surface);
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius);
+}
+
+.empty p {
+    margin: 6px 0 0;
+    font-size: 0.88rem;
+    color: var(--text-faint);
+}
+
+/* --- Activity log -------------------------------------------------------- */
+
+.log {
+    margin-top: 26px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+
+.log summary {
+    padding: 12px 16px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 580;
+    color: var(--text-dim);
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    user-select: none;
+}
+
+.log summary::-webkit-details-marker {
+    display: none;
+}
+
+.log summary::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 0.2s ease;
+}
+
+.log[open] summary::before {
+    transform: rotate(45deg);
+}
+
+.log-body {
+    max-height: 260px;
+    overflow-y: auto;
+    padding: 0 16px 12px;
+    border-top: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+    line-height: 1.7;
+    color: var(--text-dim);
+    overflow-wrap: anywhere;
+}
+
+.log-entry {
+    padding-top: 8px;
+}
+
+.log-time {
+    color: var(--text-faint);
+    margin-right: 8px;
+}
+
+.log-empty {
+    padding-top: 12px;
+    color: var(--text-faint);
+    font-style: italic;
+}
+
+/* --- Small screens ------------------------------------------------------- */
+
+@media (max-width: 600px) {
+    .wrap {
+        padding-right: calc(12px + env(safe-area-inset-right));
+        padding-left: calc(12px + env(safe-area-inset-left));
+    }
+
+    .overview h1 {
+        font-size: 1.3rem;
+    }
+
+    .rooms {
+        columns: 1;
+    }
+
+    .room {
+        margin-bottom: 12px;
+    }
+
+    .device {
+        padding: 11px 22px 11px 14px;
+    }
+
+    .brand-sub {
+        display: none;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    * {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
 }

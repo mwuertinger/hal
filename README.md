@@ -61,7 +61,24 @@ a reverse proxy in front of the unprivileged port, or
 
 ## Vendored frontend assets
 
-The Bootstrap files under `pkg/frontend/static` diverge from upstream on purpose: the
-`.map` files are not shipped and the trailing `sourceMappingURL` comments are stripped,
-keeping ~963 KB of vendor debug artifacts out of the binary. Re-apply both changes when
-upgrading Bootstrap.
+The frontend has no framework: `pkg/frontend/static` holds hand-written CSS and JS, so
+there is nothing to upgrade there. The one vendored asset is the Inter typeface
+(`static/fonts`, SIL Open Font License 1.1, license text alongside it).
+
+Both `.woff2` files are Google Fonts' own variable-weight subsets, downloaded verbatim
+from the URLs in the `@font-face` comment in `hal.css`, along with the `unicode-range`
+values that go with them, over-claims and all -- Google's `latin` range names a few
+codepoints the file does not actually contain, which is harmless because an absent
+glyph simply falls through to the next font in the stack. Do not "fix" the ranges to
+match the `cmap`: they are what makes the split work, and narrowing them would pull in
+the other subset. The split is why `latin-ext` costs nothing at runtime -- a page of
+German device names only ever fetches the 47 KB `latin` file.
+
+The declared `font-weight: 400 700` is narrower than the files, whose `fvar` axis runs
+100 to 900. That too is Google's own declaration, copied verbatim; it holds as long as
+nothing in `hal.css` asks for a weight outside 400-700, since a request beyond the
+declared range is clamped rather than synthesised.
+
+They are served from the binary rather than from `fonts.gstatic.com` because
+`hal.service` denies outbound traffic outside the LAN, so a page that reached for a CDN
+would block on the font until the browser gave up on it.
