@@ -137,13 +137,17 @@
     // change handler.
     var burst = Object.create(null);
 
-    function supersede(id) {
+    function supersede(id, state) {
         delete inFlight[id];
         epoch[id] = (epoch[id] || 0) + 1;
         if (burst[id]) {
-            // Something authoritative arrived mid-burst; unwinding to where the
-            // burst started would now discard a newer fact than any of it.
-            burst[id].superseded = true;
+            // An authoritative event is the newest thing known about this device,
+            // exactly like a request that landed. Treating it as one means a burst
+            // that then fails falls back to it, instead of being blocked from
+            // falling back at all and leaving a state that never happened.
+            burst[id].state = state;
+            burst[id].succeeded = true;
+            burst[id].failed = false;
         }
     }
 
@@ -171,7 +175,6 @@
                 epoch: epoch[id] || 0,
                 state: row.classList.contains("is-on"),
                 succeeded: false,
-                superseded: false,
                 failed: false
             };
         }
@@ -219,7 +222,7 @@
 
                 var b = burst[id];
                 delete burst[id];
-                if (!b || b.superseded || !b.failed) {
+                if (!b || !b.failed) {
                     return;
                 }
 
@@ -382,17 +385,17 @@
                 return;
             }
 
-            supersede(event.DeviceId);
+            var state = !!(event.Payload && event.Payload.State);
+            supersede(event.DeviceId, state);
 
             var row = rowFor(event.DeviceId);
             if (row) {
-                var state = !!(event.Payload && event.Payload.State);
                 row.querySelector("input[hal-device]").checked = state;
                 paint(row, state);
             }
 
             var name = row ? row.querySelector(".device-name").textContent : event.DeviceId;
-            log(name + " → " + (event.Payload && event.Payload.State ? "on" : "off"), event.Timestamp);
+            log(name + " → " + (state ? "on" : "off"), event.Timestamp);
         };
 
         socket.onclose = function () {

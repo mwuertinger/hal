@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"io/fs"
 	"path"
 	"regexp"
 	"strings"
@@ -14,6 +15,12 @@ var hashedPath = regexp.MustCompile(`^/static/.+\.[0-9a-f]{16}\.[a-z0-9]+$`)
 // used to come from mime.TypeByExtension, which buildAssets reads during
 // package-variable initialisation - before any init() could register .woff2 -
 // and which otherwise depends on /etc/mime.types being installed on the host.
+//
+// It reads contentTypes directly and never goes near the mime package. An
+// earlier version of this test called a helper that fell back to
+// mime.TypeByExtension, and so passed with contentTypes emptied entirely: on a
+// developer machine the host's /etc/mime.types supplied every answer, which is
+// precisely the thing that is absent on the target.
 func TestContentTypesArePinned(t *testing.T) {
 	want := map[string]string{
 		".woff2": "font/woff2",
@@ -23,9 +30,27 @@ func TestContentTypesArePinned(t *testing.T) {
 		".txt":   "text/plain; charset=utf-8",
 	}
 	for ext, typ := range want {
-		if got := contentTypeFor(ext); got != typ {
-			t.Errorf("contentTypeFor(%q) = %q, want %q", ext, got, typ)
+		if got := contentTypes[ext]; got != typ {
+			t.Errorf("contentTypes[%q] = %q, want %q", ext, got, typ)
 		}
+	}
+}
+
+// TestEveryShippedExtensionIsPinned fails here rather than at startup on the
+// target: an unpinned extension panics in buildAssets, which under
+// Restart=on-failure would restart-loop the unit.
+func TestEveryShippedExtensionIsPinned(t *testing.T) {
+	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if _, ok := contentTypes[path.Ext(p)]; !ok {
+			t.Errorf("%s: extension %q is not pinned, so buildAssets would panic", p, path.Ext(p))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"mime"
 	"net/http"
 	"path"
 	"sort"
@@ -61,7 +60,12 @@ func init() {
 	// to say so. Rendering both branches here turns that into a refusal to start.
 	for _, page := range []homePage{
 		{},
-		{Rooms: []frontendRoom{{Name: "room", Devices: []frontendDevice{{ID: "d", Name: "n"}}}}, Total: 1},
+		{Rooms: []frontendRoom{{
+			Name:    "room",
+			Devices: []frontendDevice{{ID: "off", Name: "off"}, {ID: "on", Name: "on", State: true}},
+			OnCount: 1,
+			AnyOn:   true,
+		}}, OnCount: 1, Total: 2},
 	} {
 		if err := indexTemplate.Execute(io.Discard, &page); err != nil {
 			panic(err)
@@ -82,19 +86,24 @@ func init() {
 // Getting this wrong is quiet but not harmless: an empty Content-Type is worse
 // than a missing one, because http.ServeContent treats it as already set and
 // skips sniffing, so the response goes out with no type at all.
+//
+// There is deliberately no fallback to mime.TypeByExtension. Falling back would
+// put the host dependence straight back: .ico, .woff and .ttf resolve on a
+// developer machine only because /etc/mime.types is there, and .otf resolves
+// through it to an OpenDocument formula-template type, which is simply wrong.
+// An asset would then pass every check here and either panic or be mistyped on
+// the Pi. Anything not listed panics at startup instead, on every host alike,
+// which a test catches long before a deploy does.
 var contentTypes = map[string]string{
 	".css":   "text/css; charset=utf-8",
+	".ico":   "image/vnd.microsoft.icon",
 	".js":    "text/javascript; charset=utf-8",
+	".json":  "application/json",
+	".png":   "image/png",
 	".svg":   "image/svg+xml",
 	".txt":   "text/plain; charset=utf-8",
+	".woff":  "font/woff",
 	".woff2": "font/woff2",
-}
-
-func contentTypeFor(ext string) string {
-	if typ, ok := contentTypes[ext]; ok {
-		return typ
-	}
-	return mime.TypeByExtension(ext)
 }
 
 // staticAsset is one embedded file as it is actually served.
@@ -143,14 +152,6 @@ func buildAssets() map[string]*staticAsset {
 		return paths[i] < paths[j]
 	})
 
-	for _, a := range paths {
-		for _, b := range paths {
-			if a != b && strings.HasPrefix(b, a) {
-				panic(fmt.Sprintf("static asset %q is a prefix of %q: rewriting url() references would corrupt the longer one", a, b))
-			}
-		}
-	}
-
 	out := make(map[string]*staticAsset, len(paths))
 	for _, p := range paths {
 		content := must(fs.ReadFile(staticFiles, p))
@@ -168,9 +169,9 @@ func buildAssets() map[string]*staticAsset {
 		hash := hex.EncodeToString(sum[:])[:16]
 		ext := path.Ext(p)
 
-		contentType := contentTypeFor(ext)
-		if contentType == "" {
-			panic(fmt.Sprintf("no content type for %q; add its extension to contentTypes", p))
+		contentType, ok := contentTypes[ext]
+		if !ok {
+			panic(fmt.Sprintf("no content type pinned for %q; add %q to contentTypes", p, ext))
 		}
 
 		out[p] = &staticAsset{
