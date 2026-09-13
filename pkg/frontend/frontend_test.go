@@ -1,8 +1,6 @@
 package frontend
 
 import (
-	"io/fs"
-	"path"
 	"regexp"
 	"strings"
 	"testing"
@@ -37,23 +35,20 @@ func TestContentTypesArePinned(t *testing.T) {
 	}
 }
 
-// TestEveryShippedExtensionIsPinned names which file is at fault. It cannot be
-// the only guard: buildAssets runs during package-variable initialisation, so an
-// unpinned extension takes the whole test binary down before any Test runs. That
-// is a fine way to fail - it fails the build - but it is not this test doing it,
-// so the rejections are tested through buildAssetsFS below instead.
-func TestEveryShippedExtensionIsPinned(t *testing.T) {
-	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		if _, ok := contentTypes[path.Ext(p)]; !ok {
-			t.Errorf("%s: extension %q is not pinned", p, path.Ext(p))
-		}
-		return nil
-	})
+// TestEveryShippedAssetBuilds runs the real embedded FS through the fallible
+// half of the pipeline, and names the file at fault.
+//
+// Its predecessor re-checked contentTypes against the same files buildAssets
+// had already validated at package-variable initialisation - so the only
+// condition it asserted on killed the test binary before it could run, and it
+// could never report anything. This can: buildAssetsFS returns its rejections.
+func TestEveryShippedAssetBuilds(t *testing.T) {
+	built, err := buildAssetsFS(staticFiles)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("the embedded assets do not build: %v", err)
+	}
+	if len(built) == 0 {
+		t.Fatal("no assets were built")
 	}
 }
 
@@ -124,29 +119,50 @@ func TestBuildAssetsRejections(t *testing.T) {
 	}
 }
 
+// TestAssetsAreServable asserts the two properties buildAssetsFS does not
+// already reject on. The three that used to sit alongside them - empty content
+// type, empty etag, a non-stylesheet naming /static/ - are all unreachable,
+// because each is either impossible by construction or an error that takes the
+// package down at init.
 func TestAssetsAreServable(t *testing.T) {
 	if len(assets) == 0 {
 		t.Fatal("no assets were built")
 	}
 
 	for logical, a := range assets {
-		if a.contentType == "" {
-			t.Errorf("%s: empty content type; ServeContent would then skip sniffing too", logical)
-		}
 		if !hashedPath.MatchString(a.publicPath) {
 			t.Errorf("%s: public path %q is not content-addressed", logical, a.publicPath)
 		}
 		if len(a.content) == 0 {
 			t.Errorf("%s: no content", logical)
 		}
-		if a.etag == "" {
-			t.Errorf("%s: no etag", logical)
-		}
-		// Only stylesheets have their references rewritten, so an unhashed
-		// /static/ reference anywhere else would 404 at runtime.
-		if path.Ext(logical) != ".css" && strings.Contains(string(a.content), "/static/") {
-			t.Errorf("%s: references /static/ but is not a stylesheet", logical)
-		}
+	}
+}
+
+// TestAssetHashCoversContentType pins that the media type is part of the hash.
+// Assets are served immutable for a year, so retyping one without changing its
+// URL would leave everyone who had already visited with the old type - and a
+// stylesheet served as the wrong type is refused outright.
+func TestAssetHashCoversContentType(t *testing.T) {
+	files := fstest.MapFS{"img/i.svg": {Data: []byte(`<svg/>`)}}
+
+	before, err := buildAssetsFS(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := contentTypes[".svg"]
+	contentTypes[".svg"] = "image/svg+xml; charset=utf-8"
+	defer func() { contentTypes[".svg"] = original }()
+
+	after, err := buildAssetsFS(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if before["img/i.svg"].publicPath == after["img/i.svg"].publicPath {
+		t.Errorf("the content type is not hashed: %q unchanged after retyping the asset",
+			after["img/i.svg"].publicPath)
 	}
 }
 
