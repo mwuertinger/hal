@@ -1,0 +1,127 @@
+[Unit]
+Description=HAL - Home Automation Link
+Documentation=https://github.com/mwuertinger/hal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/hal -config /etc/hal/hal.yaml
+User=hal
+Group=hal
+
+# HAL calls log.Fatalf() if the MQTT broker is unreachable at startup, so a broker
+# that is not up yet is a normal, recoverable condition.
+Restart=on-failure
+RestartSec=5s
+
+SyslogIdentifier=hal
+
+# ---------------------------------------------------------------------------
+# Capabilities and privileges
+#
+# HAL needs none at all: it binds an unprivileged port, reads two files and
+# talks TCP. Empty CapabilityBoundingSet= drops every capability from the
+# bounding set, so nothing can be regained.
+#
+# If you change listen-address in hal.yaml to a port below 1024, add:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# ---------------------------------------------------------------------------
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+PrivateUsers=yes
+LockPersonality=yes
+KeyringMode=private
+
+# ---------------------------------------------------------------------------
+# Filesystem
+#
+# The binary embeds its own frontend assets and keeps all state in memory
+# (pkg/persistence is an in-memory sync.Map), so HAL never needs to write
+# anywhere. ProtectSystem=strict makes the whole filesystem read-only and no
+# ReadWritePaths= is granted, so the service has no writable path at all.
+# ---------------------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateMounts=yes
+UMask=0077
+
+# /etc/hal holds hal.yaml and the MQTT CA certificate it points at; those are
+# the only files HAL reads. Redundant under ProtectSystem=strict, but stated
+# explicitly so the service's entire data dependency is visible here.
+ReadOnlyPaths=/etc/hal
+
+# The binary is statically linked (build.sh sets CGO_ENABLED=0), so nothing
+# but the executable itself ever needs to be mapped executable.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/hal
+MemoryDenyWriteExecute=yes
+
+# ---------------------------------------------------------------------------
+# Kernel, devices and host
+# ---------------------------------------------------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+DevicePolicy=closed
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+
+# ---------------------------------------------------------------------------
+# System calls
+#
+# @resources is deliberately NOT denied: the Go runtime raises RLIMIT_NOFILE
+# via setrlimit() at startup, and blocking it kills the process with SIGSYS.
+# ---------------------------------------------------------------------------
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @mount @swap @reboot @cpu-emulation @module @raw-io @debug
+
+# ---------------------------------------------------------------------------
+# Network
+#
+# AF_NETLINK is required by the Go runtime for its route/interface lookups.
+# AF_UNIX is not listed because the static build uses the pure-Go resolver;
+# add it if you ever build HAL with cgo (NSS/nscd needs a unix socket).
+# ---------------------------------------------------------------------------
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+
+# HAL only ever listens on its one HTTP port; everything else is outbound.
+# This MUST match the port in hal.yaml's http.listen-address.
+SocketBindDeny=any
+SocketBindAllow=tcp:8080
+
+# Confine traffic to loopback and RFC1918/link-local, which covers a broker
+# and a DNS resolver on the LAN. If your MQTT broker or resolver lives outside
+# your local network, add its address here or this will silently fail to
+# connect.
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=10.0.0.0/8
+IPAddressAllow=172.16.0.0/12
+IPAddressAllow=192.168.0.0/16
+IPAddressAllow=169.254.0.0/16
+IPAddressAllow=fd00::/8
+IPAddressAllow=fe80::/10
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+# Generous headroom over what the Go runtime actually spawns (roughly
+# GOMAXPROCS plus a handful), while still capping a runaway.
+TasksMax=128
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

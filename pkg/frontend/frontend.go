@@ -25,6 +25,11 @@ import (
 //go:embed template/index.html
 var templateFS embed.FS
 
+// The vendored Bootstrap files under static/ deliberately diverge from upstream: their
+// .map files are not shipped and the trailing sourceMappingURL comments are stripped, so
+// that ~963 KB of vendor debug artifacts stay out of the binary. Re-apply both when
+// upgrading Bootstrap.
+//
 //go:embed static
 var staticFS embed.FS
 
