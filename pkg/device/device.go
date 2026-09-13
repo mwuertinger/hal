@@ -56,7 +56,7 @@ func RegisterDevices(deviceConfig []config.Device) error {
 	return nil
 }
 
-func addDevice(id, name, location, typ string) error {
+func addDevice(id, name, location string, typ config.DeviceType) error {
 	if len(id) < 1 {
 		return fmt.Errorf("invalid id: %s", id)
 	}
@@ -70,7 +70,7 @@ func addDevice(id, name, location, typ string) error {
 	var dev Device
 
 	switch typ {
-	case "sonoff-mqtt-switch":
+	case config.DeviceTypeSonoffMqttSwitch:
 		dev = NewSonoffMqttSwitch(id, name, location)
 	default:
 		return fmt.Errorf("invalid typ: %s", typ)
