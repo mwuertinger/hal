@@ -28,6 +28,11 @@ func reset(t *testing.T, broker mqtt.Broker) {
 		mu.Lock()
 		devs := make([]Device, 0, len(devices))
 		for _, d := range devices {
+			if d == nil {
+				// Reserved by an addDevice that never finished; the real
+				// Shutdown skips these too.
+				continue
+			}
 			devs = append(devs, d)
 		}
 		devices = make(map[string]Device)
@@ -351,5 +356,77 @@ func TestBothTopicsShareOneChannel(t *testing.T) {
 	}
 	if !dev.LastKnownState() {
 		t.Error("LastKnownState() = false, want the later message to win")
+	}
+}
+
+// blockingBroker holds the first Subscribe open until it is released, so a
+// test can put a second registration inside the window where the first is
+// still constructing.
+type blockingBroker struct {
+	*mqtt.Fake
+	entered chan struct{}
+	release chan struct{}
+
+	mu      sync.Mutex
+	blocked bool
+}
+
+func (b *blockingBroker) Subscribe(topics ...string) (<-chan mqtt.Notification, error) {
+	// Only the first caller waits. sync.Once would block the second one too,
+	// and the second caller is the one the test needs to keep running.
+	b.mu.Lock()
+	first := !b.blocked
+	b.blocked = true
+	b.mu.Unlock()
+
+	if first {
+		close(b.entered)
+		<-b.release
+	}
+	return b.Fake.Subscribe(topics...)
+}
+
+// TestConcurrentRegistrationOfOneID: the duplicate check and the insert have to
+// be one step. Two registrations of the same id would otherwise both pass the
+// check, and the loser would be overwritten in the map with its subscriptions
+// and its goroutine still running - a device nobody can reach and nobody shuts
+// down.
+func TestConcurrentRegistrationOfOneID(t *testing.T) {
+	broker := &blockingBroker{
+		Fake:    mqtt.NewFake(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	reset(t, broker)
+
+	device := []config.Device{
+		{ID: "lamp1", Name: "Floor Lamp", Location: "Living Room", Type: config.DeviceTypeSonoffMqttSwitch},
+	}
+
+	first := make(chan error, 1)
+	go func() { first <- RegisterDevices(device) }()
+
+	// The first registration is now inside the construction of lamp1, past the
+	// duplicate check and not yet in the map.
+	<-broker.entered
+
+	if err := RegisterDevices(device); err == nil {
+		t.Error("a second registration of lamp1 succeeded while the first was still constructing it")
+	} else if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("second registration = %q, want a duplicate-id error", err)
+	}
+
+	close(broker.release)
+	if err := <-first; err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+
+	if got := len(List()); got != 1 {
+		t.Errorf("List() has %d devices, want 1", got)
+	}
+	for _, topic := range broker.Topics() {
+		if n := len(broker.Subscribers(topic)); n != 1 {
+			t.Errorf("%s has %d subscribers, want 1: an overwritten device is still listening", topic, n)
+		}
 	}
 }

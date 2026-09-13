@@ -381,15 +381,23 @@ func hostCheck(next http.Handler, allowed []string) http.Handler {
 }
 
 // lanSuffixes are the domain suffixes reserved for, or conventionally used on,
-// local networks. A name under one of them cannot be registered publicly, so it
-// cannot be the vehicle for a rebinding attack.
-// .box is not a formality: 192.168.178.0/24 is the AVM Fritz!Box factory
-// default, and a Fritz!Box publishes every LAN host as <name>.fritz.box and
-// hands that out as the DHCP search domain, so it is a name someone in the
-// house may well have bookmarked.
+// local networks. Nobody can register a name under one of them, so nobody can
+// point one at HAL: that is the entire basis for trusting them.
 var lanSuffixes = []string{
-	".local", ".lan", ".home", ".home.arpa", ".internal", ".localhost", ".box", ".localdomain",
+	".local", ".lan", ".home", ".home.arpa", ".internal", ".localhost", ".localdomain",
 }
+
+// lanNames are trusted in full, for a router that publishes LAN hosts under a
+// domain somebody really does own.
+//
+// Names and not suffixes, because .box is a delegated ICANN gTLD - it is in
+// the public suffix list and nic.box resolves - so trusting the TLD would hand
+// HAL to anyone willing to spend a few euros on a .box domain and point it at
+// 192.168.x.x, which is exactly the attack this function exists to stop.
+// fritz.box is worth naming: AVM holds it, 192.168.178.0/24 is the Fritz!Box
+// factory default, and a Fritz!Box publishes every LAN host as
+// <name>.fritz.box and hands that out as the DHCP search domain.
+var lanNames = []string{"fritz.box"}
 
 func hostIsLocal(host string, permitted map[string]bool) bool {
 	name := host
@@ -419,6 +427,11 @@ func hostIsLocal(host string, permitted map[string]bool) bool {
 	}
 	for _, suffix := range lanSuffixes {
 		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	for _, known := range lanNames {
+		if name == known || strings.HasSuffix(name, "."+known) {
 			return true
 		}
 	}
@@ -710,6 +723,11 @@ var upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
 func writePump(client *wsClient, pingInterval time.Duration) {
 	conn := client.conn
 
+	if pingInterval <= 0 {
+		// time.NewTicker panics on a non-positive interval, which the closure
+		// this was extracted from could not be handed.
+		pingInterval = wsPingInterval
+	}
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
@@ -745,8 +763,28 @@ func writePump(client *wsClient, pingInterval time.Duration) {
 				conn.Close()
 				return
 			}
+			if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+				log.Printf("WS %v: SetWriteDeadline: %v", conn.RemoteAddr(), err)
+			}
+			if err := conn.WriteJSON(wsHeartbeat{Heartbeat: true}); err != nil {
+				log.Printf("WS %v: heartbeat: %v, dropping", conn.RemoteAddr(), err)
+				dropClient(client)
+				conn.Close()
+				return
+			}
 		}
 	}
+}
+
+// wsHeartbeat is sent alongside each ping. The ping is for this end - a pong
+// resets the read deadline that reclaims a vanished client - but a browser
+// never surfaces either to JavaScript, so the page has no way to tell an idle
+// socket from a dead one. A lamp dashboard is idle almost all the time, so
+// without this the page either tears down healthy connections or trusts dead
+// ones. It is a distinct shape from an event, and the page ignores it beyond
+// noting that the connection is alive.
+type wsHeartbeat struct {
+	Heartbeat bool
 }
 
 // wsClient is one browser: its connection plus the queue feeding it. Only the
@@ -827,21 +865,35 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	go writePump(client, wsPingInterval)
 
 	// Reader. The page never sends anything, so this exists to notice the
-	// connection going away - either by a read error, or by the pong for one of
-	// the writer's pings failing to arrive within wsPongTimeout.
-	go func() {
-		_ = conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
-		conn.SetPongHandler(func(string) error {
-			return conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
-		})
+	// connection going away.
+	go readPump(client, wsPongTimeout)
+}
 
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				log.Printf("ReadMessage() error: %v, Removing WS: %v", err, conn.RemoteAddr())
-				dropClient(client)
-				conn.Close()
-				return
-			}
+// readPump watches for the connection going away - either by a read error, or
+// by the pong for one of writePump's pings failing to arrive within
+// pongTimeout. It is what reclaims a phone that left wifi without closing.
+//
+// pongTimeout is a parameter for the same reason writePump's interval is: a
+// test needs it short, and package state that live connections read is not the
+// place to put that.
+func readPump(client *wsClient, pongTimeout time.Duration) {
+	conn := client.conn
+
+	if pongTimeout <= 0 {
+		pongTimeout = wsPongTimeout
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	})
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			log.Printf("ReadMessage() error: %v, Removing WS: %v", err, conn.RemoteAddr())
+			dropClient(client)
+			conn.Close()
+			return
 		}
-	}()
+	}
 }

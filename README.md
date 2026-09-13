@@ -39,10 +39,13 @@ self-signed broker certificate has to be its own CA here.
 HAL has no authentication: being on the LAN is the credential. To keep a public
 web page from using the browser of someone on that LAN as a proxy into it (DNS
 rebinding), the frontend only answers requests whose `Host` is an IP address, a
-single-label name such as `raspberrypi`, or a name under `.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, `.localhost`, `.box` or `.localdomain`
-— `hal.fritz.box` included, which is what an AVM router hands out. Reach HAL
-under any other domain name and it answers 421 until that name is listed in
-`http.allowed-hosts`. The authoritative list is `lanSuffixes` in
+single-label name such as `raspberrypi`, or a name under `.local`, `.lan`,
+`.home`, `.home.arpa`, `.internal`, `.localhost` or `.localdomain` — none of
+which anyone can register. `fritz.box` is allowed by name, because AVM routers
+publish LAN hosts under it; the `.box` TLD as a whole is not, since it is a
+real gTLD anybody can buy into. Reach HAL under any other domain name and it
+answers 421 until that name is listed in `http.allowed-hosts`. The
+authoritative lists are `lanSuffixes` and `lanNames` in
 `pkg/frontend/frontend.go`.
 
 There is no `ExecReload=`, and HAL handles only SIGINT and SIGTERM, so a config

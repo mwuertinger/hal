@@ -33,6 +33,7 @@ type testBroker struct {
 	ln net.Listener
 
 	mu          sync.Mutex
+	conns       map[net.Conn]bool
 	subscribers map[string][]net.Conn
 	published   []Published
 	connects    int
@@ -44,7 +45,11 @@ type testBroker struct {
 
 // Serve runs the broker on an existing listener, so a test can wrap it in TLS.
 func serveTestBroker(ln net.Listener) *testBroker {
-	b := &testBroker{ln: ln, subscribers: make(map[string][]net.Conn)}
+	b := &testBroker{
+		ln:          ln,
+		conns:       make(map[net.Conn]bool),
+		subscribers: make(map[string][]net.Conn),
+	}
 	go b.accept()
 	return b
 }
@@ -190,24 +195,36 @@ func (b *testBroker) Publish(topic, payload string) int {
 
 // DropAll hangs up on every connected client without a DISCONNECT, which is
 // what a broker restart or a lost route looks like to the client.
+//
+// Every connection, not just the ones that subscribed: a client whose
+// subscriptions were refused is exactly the one a retry test needs to drop,
+// and dropping nothing at all is a test that passes without testing anything.
 func (b *testBroker) DropAll() {
 	b.mu.Lock()
-	seen := make(map[net.Conn]bool)
-	for _, conns := range b.subscribers {
-		for _, c := range conns {
-			seen[c] = true
-		}
+	conns := make([]net.Conn, 0, len(b.conns))
+	for c := range b.conns {
+		conns = append(conns, c)
 	}
+	b.conns = make(map[net.Conn]bool)
 	b.subscribers = make(map[string][]net.Conn)
 	b.mu.Unlock()
 
-	for c := range seen {
+	for _, c := range conns {
 		c.Close()
 	}
 }
 
 func (b *testBroker) serve(conn net.Conn) {
 	defer conn.Close()
+
+	b.mu.Lock()
+	b.conns[conn] = true
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		delete(b.conns, conn)
+		b.mu.Unlock()
+	}()
 
 	for {
 		header := make([]byte, 1)
@@ -252,7 +269,22 @@ func (b *testBroker) serve(conn net.Conn) {
 				b.mu.Lock()
 				refuse := b.refuseSubs
 				if !refuse {
-					b.subscribers[topic] = append(b.subscribers[topic], conn)
+					// MQTT 3.1.1 3.8.4: a SUBSCRIBE whose filter matches an
+					// existing subscription MUST replace it. Appending a second
+					// entry instead sends every message twice - and the client
+					// does re-subscribe, because paho runs OnConnect before
+					// Connect's token completes, so its resubscribe loop can
+					// race the caller's first Subscribe.
+					duplicate := false
+					for _, existing := range b.subscribers[topic] {
+						if existing == conn {
+							duplicate = true
+							break
+						}
+					}
+					if !duplicate {
+						b.subscribers[topic] = append(b.subscribers[topic], conn)
+					}
 				}
 				b.mu.Unlock()
 

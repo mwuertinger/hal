@@ -7,7 +7,7 @@ go 1.25
 // nobody builds with something older, which matters because the standard
 // library is most of HAL's attack surface and its fixes ship as toolchain
 // releases. Note that an offline builder on an older toolchain will fail here
-// rather than silently using it. CI takes its version from this file.
+// rather than silently using it.
 toolchain go1.26.8
 
 require (

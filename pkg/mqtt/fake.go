@@ -154,6 +154,13 @@ func (f *Fake) Channels() []chan Notification {
 	return out
 }
 
+// Subscribers returns the channels registered for one topic.
+func (f *Fake) Subscribers(topic string) []chan Notification {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]chan Notification(nil), f.subs[topic]...)
+}
+
 // Topics returns the subscribed topics, for a test that wants to assert on
 // what a device registered for.
 func (f *Fake) Topics() []string {

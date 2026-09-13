@@ -91,13 +91,33 @@
     // is spoken rather than only shown.
     var announceEl = document.getElementById("announce");
 
-    function announce(text) {
-        // Only when it changes: Tasmota republishes tele/<id>/STATE on a timer,
-        // so announcing every event would have a screen reader say "Desk Lamp
-        // off" for each device every few minutes with nothing having happened.
-        if (announceEl && announceEl.textContent !== text) {
-            announceEl.textContent = text;
+    var announceTimer = null;
+
+    // announce writes text into the live region. Repeats are dropped, because
+    // Tasmota republishes tele/<id>/STATE on a timer and a screen reader would
+    // otherwise say "Desk Lamp off" for every device every few minutes with
+    // nothing having happened.
+    //
+    // repeat forces one through anyway, by clearing the region first: a second
+    // failure that reads the same as the first is still news, and silence there
+    // looks like the retry worked.
+    function announce(text, repeat) {
+        if (!announceEl) {
+            return;
         }
+        clearTimeout(announceTimer);
+
+        if (announceEl.textContent === text) {
+            if (!repeat) {
+                return;
+            }
+            announceEl.textContent = "";
+            announceTimer = setTimeout(function () {
+                announceEl.textContent = text;
+            }, 100);
+            return;
+        }
+        announceEl.textContent = text;
     }
 
     // --- Requests ------------------------------------------------------------
@@ -180,6 +200,15 @@
     // Per device, the timer clearing its failure cue, so a second failure
     // restarts the cue instead of inheriting the first one's deadline.
     var failedTimers = Object.create(null);
+
+    // Per device, the pending reconciliation described in the change handler.
+    var reconcileTimers = Object.create(null);
+
+    // How long to give a device to echo a command before asking the server who
+    // was right. Comfortably longer than a Tasmota round trip on a LAN, and
+    // short enough that a genuinely contradicted switch is corrected while the
+    // user is still looking at it.
+    var RECONCILE_DELAY = 1000;
 
     function supersede(id, state) {
         // Only drop the guard when nothing is outstanding. An event that lands
@@ -279,7 +308,7 @@
                 var failure = row.querySelector(".device-name").textContent +
                     ": switch failed, " + describe(err);
                 log(failure);
-                announce(failure);
+                announce(failure, true);
                 if (burst[id]) {
                     burst[id].failed = true;
                 }
@@ -302,6 +331,13 @@
                 }
 
                 if (b.suppressed) {
+                    // Delayed on purpose. /api/state is fed by the same MQTT
+                    // stream the suppressed frame came from, so asking the
+                    // instant the request settles gets the pre-echo answer -
+                    // which repaints the very state that was suppressed, half a
+                    // second later instead of immediately. Waiting lets the
+                    // device's echo land first, and if it does, this resync
+                    // only confirms what the event already painted.
                     // An event arrived mid-request and its repaint was held
                     // back, because at that moment there was no way to tell
                     // whether it predated the command - Tasmota republishes
@@ -310,7 +346,11 @@
                     // the server's own view once everything has landed, and
                     // applyStates has the epoch guard that stops a stale
                     // snapshot overwriting anything newer.
-                    resync();
+                    clearTimeout(reconcileTimers[id]);
+                    reconcileTimers[id] = setTimeout(function () {
+                        delete reconcileTimers[id];
+                        resync();
+                    }, RECONCILE_DELAY);
                 }
 
                 if (!b.failed) {
@@ -474,6 +514,14 @@
     var lastContact = 0;
     var STALE_AFTER = 60000;
 
+    // reconnectNow reconnects on the next tick, for when something has just
+    // told us the network is back or the socket is gone.
+    function reconnectNow() {
+        setStatus("down", "Reconnecting");
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 0);
+    }
+
     function reconnectLater() {
         // Back off up to 30s so a server that stays down is not hammered.
         var delay = Math.min(1000 * Math.pow(2, retry++), 30000);
@@ -531,6 +579,12 @@
             }
 
             lastContact = Date.now();
+
+            if (event.Heartbeat) {
+                // Proof the socket is alive while nothing is happening, which
+                // on a lamp dashboard is most of the time. Nothing else to do.
+                return;
+            }
 
             if (!event.Payload || typeof event.Payload.State !== "boolean") {
                 // Not a switch event. Coercing an unknown payload with !! would
@@ -591,11 +645,12 @@
     function recheck() {
         if (!socketOpen) {
             // Coming back to a page that is waiting out a backoff should not
-            // mean waiting out the rest of it.
+            // mean waiting out the rest of it. The backoff itself is left
+            // alone: it is reset by a connection that stays up, and resetting
+            // it here would let a phone handing off between wifi and cellular
+            // - which fires "online" repeatedly - hammer a server that is down.
             if (socket === null) {
-                retry = 0;
-                clearTimeout(reconnectTimer);
-                connect();
+                reconnectNow();
             }
             return;
         }
@@ -614,7 +669,7 @@
             dying.onmessage = null;
             dying.onerror = null;
             dying.close();
-            reconnectLater();
+            reconnectNow();
             return;
         }
 

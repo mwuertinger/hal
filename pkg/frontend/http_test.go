@@ -3,6 +3,7 @@ package frontend
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -173,8 +174,18 @@ func TestDeviceIdComesFromThePathValue(t *testing.T) {
 	}
 
 	// A sub-path is not a device: {device} must not match across a separator.
-	if resp := do(t, "PUT", srv.URL+"/api/lamp1/extra", "true"); resp.StatusCode != http.StatusNotFound {
+	// The router's 404 carries net/http's own body; the handler's is empty, so
+	// the body is what says which of the two answered.
+	resp := do(t, "PUT", srv.URL+"/api/lamp1/extra", "true")
+	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("PUT /api/lamp1/extra = %d, want 404", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) == 0 {
+		t.Error("PUT /api/lamp1/extra was answered by the handler, so {device} matched across a separator")
 	}
 }
 
@@ -282,6 +293,14 @@ func TestHostCheck(t *testing.T) {
 		{"localhost:8080", true},
 		{"raspberrypi:8080", true},
 		{"hal.local", true},
+		{"hal.localdomain", true},
+		// .box is a delegated ICANN gTLD, unlike every other suffix here, so
+		// only the name AVM actually holds is trusted. Trusting the TLD would
+		// let anyone who registers a .box domain rebind straight into HAL.
+		{"fritz.box", true},
+		{"hal.fritz.box", true},
+		{"rebind.box", false},
+		{"evil.notfritz.box", false},
 		{"hal.lan:8080", true},
 		{"hal.home.arpa", true},
 		{"hal.example.com", true}, // allow-listed
@@ -678,11 +697,18 @@ func TestWriterPings(t *testing.T) {
 		return nil
 	})
 
-	// A ping handler only runs from inside a read.
+	// A ping handler only runs from inside a read; the reads also collect the
+	// heartbeat frames, which are what the page itself can see.
+	heartbeats := make(chan wsHeartbeat, 4)
 	go func() {
 		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
+			var msg wsHeartbeat
+			if err := conn.ReadJSON(&msg); err != nil {
 				return
+			}
+			select {
+			case heartbeats <- msg:
+			default:
 			}
 		}
 	}()
@@ -690,8 +716,59 @@ func TestWriterPings(t *testing.T) {
 	select {
 	case <-pinged:
 	case <-time.After(5 * time.Second):
-		t.Error("no ping arrived: a dead connection would only be noticed by TCP keepalive")
+		t.Fatal("no ping arrived: a dead connection would only be noticed by TCP keepalive")
 	}
+
+	select {
+	case msg := <-heartbeats:
+		if !msg.Heartbeat {
+			t.Errorf("heartbeat frame = %+v", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("no heartbeat frame: a browser cannot see the ping, so without this the page " +
+			"has no way to tell an idle socket from a dead one")
+	}
+}
+
+// TestReaderDropsAClientThatStopsAnsweringPings is the other half of the
+// keepalive: the ping notices, but only the read deadline reclaims. A phone
+// that left wifi answers nothing, and without this its connection and its two
+// goroutines sit there until TCP gives up, minutes later.
+func TestReaderDropsAClientThatStopsAnsweringPings(t *testing.T) {
+	waitClients(t, 0)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		client := &wsClient{conn: conn, send: make(chan device.Event, 1)}
+		if !addClient(client) {
+			conn.Close()
+			return
+		}
+		// A ping every 20ms, and a pong must arrive within 100ms.
+		go writePump(client, 20*time.Millisecond)
+		go readPump(client, 100*time.Millisecond)
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Scheme = "ws"
+
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), http.Header{"Origin": {srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// The client never reads, so gorilla never runs its ping handler and never
+	// answers a pong - which is exactly what a sleeping phone looks like.
+	waitClients(t, 1)
+	waitClients(t, 0)
 }
 
 // TestSlowClientIsDropped: the broadcaster must never block on one unresponsive
@@ -710,7 +787,16 @@ func TestSlowClientIsDropped(t *testing.T) {
 	go broadcast(events)
 	defer func() {
 		close(shutdown)
-		wg.Wait()
+		// Bounded: a broadcaster that is blocked - the thing this test exists
+		// to catch - never reaches its select, so an unbounded Wait here turns
+		// the assertion below into a ten-minute timeout on the whole binary.
+		drained := make(chan struct{})
+		go func() { wg.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-time.After(5 * time.Second):
+			t.Error("the broadcaster did not exit")
+		}
 	}()
 
 	srv := newServer(t)
@@ -727,7 +813,11 @@ func TestSlowClientIsDropped(t *testing.T) {
 	// Push until the client is dropped: first its queue fills, then the socket
 	// stops accepting, then the broadcaster takes the drop path. Every send
 	// here must return promptly - that is the property under test.
-	deadline := time.Now().Add(20 * time.Second)
+	// Two seconds, not twenty: dropping a slow client takes milliseconds, while
+	// the write deadline behind it takes wsWriteTimeout. A generous bound let
+	// that fallback stand in for the drop path, so the test passed with the
+	// drop path deleted.
+	deadline := time.Now().Add(2 * time.Second)
 	for i := 0; clientCount() > 0; i++ {
 		if time.Now().After(deadline) {
 			t.Fatal("the client was never dropped")

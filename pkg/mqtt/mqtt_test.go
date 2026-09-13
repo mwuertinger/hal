@@ -436,3 +436,120 @@ func TestConnectConfigErrorsAreMarked(t *testing.T) {
 		t.Errorf("Connect() with a CA file holding no certificate = %v, want ErrConfig", err)
 	}
 }
+
+// TestSubscribeAfterShutdown and TestNoResubscribeAfterShutdown cover the two
+// reachable effects of the closed flag. Both were previously invisible to the
+// suite: the flag could be deleted from Subscribe and from onConnect and
+// everything stayed green, because Shutdown also nils the map.
+func TestSubscribeAfterShutdown(t *testing.T) {
+	b, _ := connected(t)
+	b.Shutdown()
+
+	if _, err := b.Subscribe("stat/lamp/POWER"); err == nil {
+		t.Error("Subscribe() after Shutdown() = nil, want an error")
+	}
+}
+
+// TestNoResubscribeAfterShutdown: Disconnect returns after its quiesce period
+// whether or not the teardown finished, so paho can still be reconnecting when
+// Shutdown returns. Without the guard, that reconnect's onConnect re-subscribes
+// to topics nobody is listening to any more.
+func TestNoResubscribeAfterShutdown(t *testing.T) {
+	b, tb := connected(t)
+
+	if _, err := b.Subscribe("stat/lamp/POWER"); err != nil {
+		t.Fatal(err)
+	}
+
+	b.mu.Lock()
+	b.closed = true
+	b.mu.Unlock()
+
+	// Drive onConnect directly: this is the callback paho would run on a
+	// reconnect that lands inside the Disconnect window.
+	before := len(tb.Topics())
+	b.subs = map[string][]chan Notification{"tele/other/STATE": nil}
+	b.onConnect(b.client)
+
+	if got := len(tb.Topics()); got != before {
+		t.Errorf("the broker gained %d topic(s) after shutdown, want none", got-before)
+	}
+}
+
+// TestResubscribeRetryRecovers covers the retry loop: a topic the broker
+// refuses at reconnect time must not stay dark until the next disconnect,
+// which for a healthy connection could be days.
+func TestResubscribeRetryRecovers(t *testing.T) {
+	b, tb := connected(t)
+
+	c, err := b.Subscribe("stat/lamp/POWER")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The ACL turns hostile, then the connection drops, so onConnect's
+	// resubscribe fails and hands over to the retry.
+	tb.RefuseSubscriptions(true)
+	tb.DropAll()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for tb.Connects() < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tb.Connects() < 2 {
+		t.Fatal("the client never reconnected")
+	}
+
+	// The ACL is fixed. Nothing else will prompt another SUBSCRIBE.
+	tb.RefuseSubscriptions(false)
+
+	for time.Now().Before(deadline) {
+		if tb.Publish("stat/lamp/POWER", "OFF") > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	select {
+	case n := <-c:
+		if n.Msg != "OFF" {
+			t.Errorf("Msg = %q, want OFF", n.Msg)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the topic stayed dark: the resubscribe was never retried")
+	}
+}
+
+func TestCertificateProblemIsAConfigError(t *testing.T) {
+	tb, _ := startTestBroker(t)
+	_, otherCA := serverCert(t, t.TempDir())
+
+	err := New().Connect(config.Mqtt{Server: tb.Addr(), CaPath: otherCA, User: "hal"})
+	if !errors.Is(err, ErrConfig) {
+		t.Errorf("Connect() with an untrusted certificate = %v, want it to wrap ErrConfig: it fails "+
+			"the same way on every retry, so the unit should fail rather than restart forever", err)
+	}
+}
+
+func TestSubscribeIgnoresARepeatedTopic(t *testing.T) {
+	b, tb := connected(t)
+
+	c, err := b.Subscribe("stat/lamp/POWER", "stat/lamp/POWER")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tb.Publish("stat/lamp/POWER", "ON")
+
+	select {
+	case <-c:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no notification")
+	}
+
+	select {
+	case n := <-c:
+		t.Errorf("the message was delivered twice: %+v", n)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

@@ -10,7 +10,9 @@
 # example is exempted explicitly.
 hal.yaml*
 !hal.yaml.example
-config/
+# Anchored. Unanchored, "config/" also matches pkg/config/, which silently
+# makes every new file in the config package unaddable.
+/config/
 *.crt
 *.key
 *.pem

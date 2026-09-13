@@ -93,7 +93,10 @@ type broker struct {
 	subs      map[string][]chan Notification
 	onConnFns []func()
 	dropped   map[string]int
-	closed    bool
+	// generation counts connections, so a retry started for one of them can
+	// tell that it has been superseded.
+	generation uint64
+	closed     bool
 
 	// done is closed by Shutdown, which is what ends a resubscribe retry.
 	done chan struct{}
@@ -149,13 +152,24 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 
 	token := client.Connect()
 	if !token.WaitTimeout(connectTimeout) {
-		// Cleared, so a caller that decides to retry is not told it is
-		// already connected to a client that never connected.
+		// Cleared, so a caller that decides to retry is not told it is already
+		// connected to a client that never connected - and disconnected first,
+		// because paho's attempt is still running and may yet succeed, which
+		// would leave a live authenticated client that Shutdown skips.
+		client.Disconnect(0)
 		s.client = nil
 		return fmt.Errorf("connect to %s timed out after %v", mqttConfig.Server, connectTimeout)
 	}
 	if err := token.Error(); err != nil {
+		client.Disconnect(0)
 		s.client = nil
+		if certificateProblem(err) {
+			// A certificate that does not chain to mqtt.ca-path, or whose SAN
+			// does not cover mqtt.server, fails identically on every retry.
+			// Restarting every five seconds forever hides that; failing the
+			// unit puts it in systemctl status.
+			return fmt.Errorf("%w: connect to %s failed: %w", ErrConfig, mqttConfig.Server, err)
+		}
 		// Unlike the client this replaced, a refused CONNACK - a wrong
 		// password, say - arrives here as an error instead of being reported
 		// as a successful connection.
@@ -188,6 +202,19 @@ func tlsConfig(caPath string) (*tls.Config, error) {
 	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
 }
 
+// certificateProblem reports whether err is the broker's certificate failing
+// to verify, rather than the broker being unreachable.
+func certificateProblem(err error) bool {
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	var alert *tls.CertificateVerificationError
+	return errors.As(err, &unknownAuthority) ||
+		errors.As(err, &hostname) ||
+		errors.As(err, &invalid) ||
+		errors.As(err, &alert)
+}
+
 // clientID identifies this instance to the broker. It must not be the username:
 // MQTT requires a broker to disconnect an existing client when a second one
 // connects with the same id, so two instances sharing a username kick each
@@ -206,6 +233,8 @@ func clientID() string {
 // this is what stops a reconnected HAL from sitting there receiving nothing.
 func (s *broker) onConnect(client paho.Client) {
 	s.mu.Lock()
+	s.generation++
+	generation := s.generation
 	topics := make([]string, 0, len(s.subs))
 	for topic := range s.subs {
 		topics = append(topics, topic)
@@ -229,9 +258,11 @@ func (s *broker) onConnect(client paho.Client) {
 	if len(failed) > 0 {
 		// A topic that stays unsubscribed is a device that silently never
 		// updates again, so keep trying rather than leaving one log line
-		// behind. The retry ends when the connection drops, at which point
-		// the next onConnect takes over.
-		go s.retrySubscribes(client, failed)
+		// behind. The retry ends when this connection ends, at which point the
+		// next onConnect takes over - generation is what tells it apart from
+		// the connection that replaced it, since paho reuses one Client and
+		// IsConnectionOpen would be true again for the newer one.
+		go s.retrySubscribes(client, generation, failed)
 	}
 
 	if len(topics) > 0 {
@@ -251,7 +282,7 @@ func (s *broker) onConnect(client paho.Client) {
 
 // retrySubscribes keeps trying the topics onConnect could not subscribe to,
 // for as long as this connection lasts.
-func (s *broker) retrySubscribes(client paho.Client, topics []string) {
+func (s *broker) retrySubscribes(client paho.Client, generation uint64, topics []string) {
 	delay := 5 * time.Second
 
 	for {
@@ -261,9 +292,13 @@ func (s *broker) retrySubscribes(client paho.Client, topics []string) {
 		case <-time.After(delay):
 		}
 
-		if !client.IsConnectionOpen() {
-			// The connection went away; the next onConnect re-issues
-			// everything anyway.
+		s.mu.Lock()
+		current := s.generation
+		s.mu.Unlock()
+
+		if !client.IsConnectionOpen() || current != generation {
+			// This connection is gone; the onConnect for its replacement
+			// re-issues everything anyway.
 			return
 		}
 
@@ -335,7 +370,7 @@ func (s *broker) deliver(topic, payload string) {
 			s.dropped[topic]++
 			if n := s.dropped[topic]; n == 1 || n%100 == 0 {
 				log.Printf("MQTT %s: subscriber %d notifications behind, %d dropped so far",
-					topic, notificationQueue, n)
+					topic, cap(c), n)
 			}
 		}
 	}
@@ -425,7 +460,14 @@ func (s *broker) Subscribe(topics ...string) (<-chan Notification, error) {
 		return nil, errors.New("broker is shut down")
 	}
 	fresh := make([]string, 0, len(topics))
+	seen := make(map[string]bool, len(topics))
 	for _, topic := range topics {
+		if seen[topic] {
+			// Registering twice would deliver every message twice.
+			continue
+		}
+		seen[topic] = true
+
 		if len(s.subs[topic]) == 0 {
 			fresh = append(fresh, topic)
 		}
