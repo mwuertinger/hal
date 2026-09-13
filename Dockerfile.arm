@@ -1,8 +1,0 @@
-FROM arm32v6/alpine:latest
-
-COPY hal-arm /hal
-COPY frontend /frontend
-
-VOLUME /config
-ENTRYPOINT ["/hal"]
-CMD ["-config", "/config/hal.yaml"]

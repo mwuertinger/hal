@@ -2,9 +2,10 @@ package frontend
 
 import (
 	"context"
+	"embed"
 	"html/template"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"log"
 	"net/http"
 	"sort"
@@ -18,11 +19,27 @@ import (
 	"github.com/pkg/errors"
 )
 
+//go:embed template/index.html
+var templateFS embed.FS
+
+//go:embed static
+var staticFS embed.FS
+
 var (
 	srv      *http.Server
 	shutdown chan interface{}
 	wg       sync.WaitGroup
+
+	indexTemplate = template.Must(template.ParseFS(templateFS, "template/index.html"))
+	staticFiles   = must(fs.Sub(staticFS, "static"))
 )
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
 
 // Start starts the HTTP server listening on listenAddress in the format address:port. The function returns immediately
 // and calls log.Fatal() should an error occur.
@@ -73,7 +90,7 @@ func Start(httpConfig config.Http) error {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/", homeHandler).Methods("GET")
-	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("frontend/static"))))
+	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.FS(staticFiles))))
 	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
 	r.HandleFunc("/api/ws", wsHandler)
 
@@ -123,20 +140,6 @@ type homePage struct {
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
-	tmplSrc, err := ioutil.ReadFile("frontend/template/index.html")
-	if err != nil {
-		log.Printf("unable to read template: %v", err)
-		w.WriteHeader(500)
-		return
-	}
-
-	tmpl, err := template.New("index.html").Parse(string(tmplSrc))
-	if err != nil {
-		log.Printf("unable to parse template: %v", err)
-		w.WriteHeader(500)
-		return
-	}
-
 	rooms := make(map[string]*frontendRoom)
 	for _, d := range device.List() {
 		if _, ok := rooms[d.Location()]; !ok {
@@ -162,7 +165,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(200)
-	err = tmpl.Execute(w, &homePage{
+	err := indexTemplate.Execute(w, &homePage{
 		Rooms: frontendRooms,
 	})
 
