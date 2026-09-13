@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"github.com/mwuertinger/hal/pkg/mqtt"
 	"log"
 	"os"
 	"os/signal"
@@ -11,28 +10,35 @@ import (
 	"github.com/mwuertinger/hal/pkg/config"
 	"github.com/mwuertinger/hal/pkg/device"
 	"github.com/mwuertinger/hal/pkg/frontend"
-	"github.com/mwuertinger/hal/pkg/persistence"
+	"github.com/mwuertinger/hal/pkg/mqtt"
 )
 
+// exitConfig is sysexits.h's EX_CONFIG. hal.service names it in
+// RestartPreventExitStatus=, so a config HAL can never load stops the unit
+// instead of restarting it every five seconds until someone reads the journal.
+const exitConfig = 78
+
 func main() {
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, os.Kill, syscall.SIGTERM)
+	// journald stamps every entry itself, and this is a systemd service, so
+	// the log package's own timestamp is only a second copy of it.
+	log.SetFlags(0)
+
+	sigc := make(chan os.Signal, 2)
+	// Not os.Kill: SIGKILL cannot be caught, so listing it only suggests it can.
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 
 	configPath := flag.String("config", "", "Path to config file.")
 	flag.Parse()
 
 	if len(*configPath) < 1 {
-		log.Fatalf("Missing -config argument.")
+		log.Print("Missing -config argument.")
+		os.Exit(exitConfig)
 	}
 
 	c, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to read config file: %v", err)
-	}
-
-	persistence := persistence.GetInMemoryService()
-	if err := persistence.Start(); err != nil {
-		log.Fatalf("persistence.Start: %v", err)
+		log.Printf("Failed to read config file: %v", err)
+		os.Exit(exitConfig)
 	}
 
 	mqttBroker := mqtt.New()
@@ -55,7 +61,17 @@ func main() {
 	sig := <-sigc
 	log.Printf("Received %v signal, shutting down...", sig)
 
+	// A second signal exits immediately: a shutdown that cannot finish should
+	// not need SIGKILL to escape.
+	go func() {
+		sig := <-sigc
+		log.Printf("Received %v signal again, exiting now", sig)
+		os.Exit(1)
+	}()
+
+	// Outside in: stop serving, then stop the devices producing events, then
+	// close the broker connection they publish through.
 	frontend.Shutdown()
-	mqttBroker.Shutdown()
 	device.Shutdown()
+	mqttBroker.Shutdown()
 }
