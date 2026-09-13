@@ -72,6 +72,28 @@
         }
     }
 
+    // --- Requests ------------------------------------------------------------
+
+    var REQUEST_TIMEOUT = 10000;
+
+    // fetchWithTimeout bounds a request the way the server cannot. A phone that
+    // walks out of WiFi mid-request leaves the socket open with nothing coming
+    // back, and without this the promise never settles: the switch stays pending
+    // and the device's chain stops accepting taps.
+    function fetchWithTimeout(url, options) {
+        var abort = new AbortController();
+        var timer = setTimeout(function () {
+            abort.abort();
+        }, REQUEST_TIMEOUT);
+
+        options = options || {};
+        options.signal = abort.signal;
+
+        return fetch(url, options).finally(function () {
+            clearTimeout(timer);
+        });
+    }
+
     // --- Switching ---------------------------------------------------------
 
     // One token per device while a PUT is in flight. Anything that learns the real
@@ -111,8 +133,15 @@
         var target = input.checked;
         var token = {};
 
+        // Kept so the revert below can put it back. Bumping at tap time is what
+        // stops an in-flight resync from painting over the optimistic state, but
+        // if the tap turns out to have failed then nothing was learned, and
+        // leaving the epoch raised would disqualify this device from the very
+        // resync that would have corrected it.
+        var epochBefore = epoch[id] || 0;
+
         inFlight[id] = token;
-        epoch[id] = (epoch[id] || 0) + 1;
+        epoch[id] = epochBefore + 1;
         queued[id] = (queued[id] || 0) + 1;
 
         // Show the new state right away, then correct it if the request fails:
@@ -121,7 +150,7 @@
         row.classList.add("is-pending");
 
         function send() {
-            return fetch("/api/" + encodeURIComponent(id), {
+            return fetchWithTimeout("/api/" + encodeURIComponent(id), {
                 method: "PUT",
                 body: target ? "true" : "false"
             }).then(function (response) {
@@ -143,6 +172,10 @@
                 }
                 input.checked = !target;
                 paint(row, !target);
+
+                // Still the newest token, so nothing has bumped the epoch since
+                // this tap did; putting it back cannot discard anyone else's fact.
+                epoch[id] = epochBefore;
             }).finally(function () {
                 if (inFlight[id] === token) {
                     delete inFlight[id];
@@ -212,50 +245,67 @@
     // between - the gap before the socket connects, and the whole of any outage -
     // is invisible to the page, so refetch the truth whenever the socket comes up.
     var resyncSeq = 0;
+    var resyncRetry = 0;
+    var resyncTimer = null;
+    var socketOpen = false;
 
+    function applyStates(states, seen) {
+        Object.keys(states).forEach(function (id) {
+            // Skip a device with a request in flight, and one that something told
+            // us about after this snapshot was taken - a websocket event, or the
+            // user's own tap. Either is newer than what we asked for.
+            if (id in inFlight || (epoch[id] || 0) !== (seen[id] || 0)) {
+                return;
+            }
+            var row = rowFor(id);
+            if (!row) {
+                return;
+            }
+            var state = !!states[id];
+            row.querySelector("input[hal-device]").checked = state;
+            paint(row, state);
+        });
+    }
+
+    // resync fetches the authoritative state and reconciles the page against it.
+    //
+    // Until it succeeds the page is showing state it cannot vouch for, so the
+    // status pill does not say "Live" yet - claiming to be live over stale rows is
+    // the exact symptom the resync exists to prevent. A failure is retried with
+    // the same backoff the socket uses, because one failed fetch would otherwise
+    // strand the page in that state until the socket happened to drop.
     function resync() {
         var seq = ++resyncSeq;
         var seen = Object.assign(Object.create(null), epoch);
 
-        // The request itself must not hang forever: /api/state is served by the
-        // same handler chain as everything else, and a page waiting on it silently
-        // is worse than one that says so.
-        var abort = new AbortController();
-        var timer = setTimeout(function () {
-            abort.abort();
-        }, 10000);
-
-        return fetch("/api/state", { signal: abort.signal }).then(function (response) {
+        return fetchWithTimeout("/api/state").then(function (response) {
             if (!response.ok) {
                 throw new Error("HTTP " + response.status);
             }
             return response.json();
         }).then(function (states) {
-            // A newer resync is already in flight; this snapshot is older than the
-            // one that will replace it, so applying it would only flicker.
+            // A newer resync is already in flight and owns the outcome, status
+            // included; this snapshot is older than the one about to replace it.
             if (seq !== resyncSeq) {
                 return;
             }
-
-            Object.keys(states).forEach(function (id) {
-                // Skip a device with a request in flight, and one that something
-                // told us about after this snapshot was taken - a websocket event,
-                // or the user's own tap. Either is newer than what we asked for.
-                if (id in inFlight || (epoch[id] || 0) !== (seen[id] || 0)) {
-                    return;
-                }
-                var row = rowFor(id);
-                if (!row) {
-                    return;
-                }
-                var state = !!states[id];
-                row.querySelector("input[hal-device]").checked = state;
-                paint(row, state);
-            });
+            applyStates(states, seen);
+            resyncRetry = 0;
+            if (socketOpen) {
+                setStatus("live", "Live");
+            }
         }).catch(function (err) {
+            if (seq !== resyncSeq) {
+                return;
+            }
             log("could not read device state: " + err.message);
-        }).finally(function () {
-            clearTimeout(timer);
+            if (!socketOpen) {
+                return;
+            }
+            setStatus("down", "Out of sync");
+            var delay = Math.min(1000 * Math.pow(2, resyncRetry++), 30000);
+            clearTimeout(resyncTimer);
+            resyncTimer = setTimeout(resync, delay);
         });
     }
 
@@ -269,7 +319,13 @@
 
         socket.onopen = function () {
             retry = 0;
-            setStatus("live", "Live");
+            socketOpen = true;
+
+            // Not "Live" yet: the socket only carries changes from this moment on,
+            // so the rows are unverified until the resync below comes back.
+            setStatus("connecting", "Syncing");
+            resyncRetry = 0;
+            clearTimeout(resyncTimer);
             resync();
         };
 
@@ -296,6 +352,11 @@
         };
 
         socket.onclose = function () {
+            socketOpen = false;
+            // Retrying /api/state while the socket is down is pointless; the next
+            // onopen starts a fresh one.
+            clearTimeout(resyncTimer);
+
             // The server restarts on config changes and the phone drops the
             // socket whenever it sleeps, so reconnecting is the normal path,
             // not an error path. Back off up to 30s so a server that stays
