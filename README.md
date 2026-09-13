@@ -46,7 +46,10 @@ Three directives are deployment-specific and worth checking before first start:
   resolver such as `1.1.1.1` is outside those ranges. The symptom is an unusual
   `connect: permission denied` at startup — add the address if you see it.
 - `RestrictFileSystems=` names `ext4`, the Raspberry Pi OS default. Change it if your
-  root filesystem is btrfs, xfs or f2fs, or drop the line if unsure.
+  root filesystem differs, or drop the line if unsure. The likely case on a Pi is
+  `overlay`: raspi-config's Overlay File System option makes `/` an overlayfs, and the
+  unit would then fail to start. btrfs, xfs and f2fs need the same treatment. The
+  directive is inert unless `bpf` appears in `/sys/kernel/security/lsm`.
 
 Listening on a port below 1024 takes more than granting `CAP_NET_BIND_SERVICE`: a
 capability held inside the unit's private user namespace does not authorize a bind

@@ -79,9 +79,16 @@ ExecPaths=/usr/local/bin/hal
 MemoryDenyWriteExecute=yes
 
 # Only the kernel API filesystems plus the one holding / and /etc/hal. ext4 is
-# the Raspberry Pi OS default; CHANGE IT if your root filesystem is btrfs, xfs
-# or f2fs, or drop this line if unsure. Needs systemd >= 250 and BPF LSM; where
-# unsupported systemd logs a warning and carries on.
+# the Raspberry Pi OS default and also covers ext2/ext3; tmpfs is reachable via
+# devtmpfs, which shares its superblock magic. CHANGE IT if your root
+# filesystem differs, or drop this line if unsure. The likely case on a Pi is
+# "overlay": raspi-config's Overlay File System option makes / an overlayfs to
+# spare the SD card, and every open including the binary itself would then be
+# denied. btrfs, xfs and f2fs need the same treatment.
+#
+# Needs systemd >= 250 and the BPF LSM; where unsupported systemd logs a
+# warning and carries on, so the line is inert rather than fatal. Check with
+# "cat /sys/kernel/security/lsm" — it only does anything if bpf is listed.
 RestrictFileSystems=@basic-api ext4
 
 # ---------------------------------------------------------------------------
