@@ -34,6 +34,11 @@ var templateFS embed.FS
 //go:embed static
 var staticFS embed.FS
 
+// wsWriteTimeout bounds a single frame written to one websocket client. It only
+// has to be generous enough for a healthy client on a slow link; a client that
+// cannot absorb one small JSON event within it is treated as gone.
+const wsWriteTimeout = 5 * time.Second
+
 var (
 	srv      *http.Server
 	shutdown chan interface{}
@@ -132,9 +137,17 @@ func Start(httpConfig config.Http) error {
 
 				wsConnectionsMu.Lock()
 				for c := range wsConnections {
-					err := c.WriteJSON(event)
-					if err != nil {
-						log.Printf("WS %v: WriteJSON: %v", c.RemoteAddr(), err)
+					// Bound every write. A suspended phone sends no RST, so
+					// without this a single unresponsive client makes the whole
+					// dashboard unresponsive for everyone until the kernel gives
+					// up on the connection minutes later.
+					if err := c.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+						log.Printf("WS %v: SetWriteDeadline: %v", c.RemoteAddr(), err)
+					}
+					if err := c.WriteJSON(event); err != nil {
+						log.Printf("WS %v: WriteJSON: %v, dropping", c.RemoteAddr(), err)
+						delete(wsConnections, c)
+						c.Close()
 					}
 				}
 				wsConnectionsMu.Unlock()
@@ -268,6 +281,7 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	if err := json.NewEncoder(w).Encode(states); err != nil {
 		log.Printf("unable to encode state: %v", err)
 	}
@@ -305,12 +319,12 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 
 	switchDev, success := dev.(device.Switch)
 	if !success {
-		log.Printf("device %s is not a switch", dev)
+		log.Printf("device %s is not a switch", deviceId)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Device: %s, Target state: %v\n", switchDev, status)
+	log.Printf("Device: %s, Target state: %v", deviceId, status)
 	if err = switchDev.Switch(status); err != nil {
 		log.Printf("send command failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)

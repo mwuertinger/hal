@@ -71,8 +71,12 @@
         --text-faint: #6e7781;
         --on: #ffb340;
         --on-soft: rgba(255, 179, 64, 0.14);
+        --on-halo: rgba(255, 179, 64, 0.45);
+        --on-edge: rgba(255, 179, 64, 0.35);
         --live: #3fb950;
+        --live-halo: rgba(63, 185, 80, 0.22);
         --down: #f85149;
+        --down-halo: rgba(248, 81, 73, 0.22);
         --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -16px rgba(0, 0, 0, 0.8);
     }
 }
@@ -93,16 +97,23 @@ body {
     font-size: 16px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
+    /* Only the bottom inset belongs on body. The left and right ones live on
+       .wrap so that the sticky bar's background still reaches the screen edges
+       in landscape. */
+    padding-bottom: env(safe-area-inset-bottom);
 }
 
 /* Keep content clear of the notch and the rounded corners in landscape. The insets
    go here rather than on body so that the sticky bar's background still reaches the
    edges of the screen. */
+/* Longhands, not a shorthand: .wrap outranks main, and a shorthand here would
+   reset main's vertical padding to zero. */
 .wrap {
     width: 100%;
     max-width: 1040px;
     margin: 0 auto;
-    padding: 0 calc(16px + env(safe-area-inset-right)) 0 calc(16px + env(safe-area-inset-left));
+    padding-right: calc(16px + env(safe-area-inset-right));
+    padding-left: calc(16px + env(safe-area-inset-left));
 }
 
 /* --- Top bar ------------------------------------------------------------- */
@@ -513,7 +524,8 @@ input:focus-visible + .slider {
 
 @media (max-width: 600px) {
     .wrap {
-        padding: 0 12px;
+        padding-right: calc(12px + env(safe-area-inset-right));
+        padding-left: calc(12px + env(safe-area-inset-left));
     }
 
     .overview h1 {

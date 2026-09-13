@@ -75,13 +75,29 @@
     // --- Switching ---------------------------------------------------------
 
     // One token per device while a PUT is in flight. Anything that learns the real
-    // state in the meantime - a websocket event, a resync - drops the token, which
-    // is what stops a late failure from reverting to a state that is no longer the
-    // one we started from.
+    // state in the meantime - a websocket event, a newer click - drops the token,
+    // which is what stops a late failure from reverting to a state that is no
+    // longer the one we started from.
     var inFlight = Object.create(null);
+
+    // Bumped whenever something authoritative is applied to a device. A resync
+    // compares this against the value it captured before its request went out, so
+    // a snapshot that was already stale when it arrived cannot overwrite a newer
+    // fact. See resync().
+    var epoch = Object.create(null);
+
+    // One promise chain per device, so two taps cannot race each other to the
+    // broker. Without this the second PUT can overtake the first and leave the
+    // lamp in the state the user did not ask for, with the page none the wiser.
+    var chain = Object.create(null);
+
+    // How many requests are outstanding per device, so the pending state clears
+    // when the last one settles rather than when the newest token happens to win.
+    var queued = Object.create(null);
 
     function supersede(id) {
         delete inFlight[id];
+        epoch[id] = (epoch[id] || 0) + 1;
     }
 
     document.addEventListener("change", function (event) {
@@ -96,40 +112,49 @@
         var token = {};
 
         inFlight[id] = token;
+        epoch[id] = (epoch[id] || 0) + 1;
+        queued[id] = (queued[id] || 0) + 1;
 
         // Show the new state right away, then correct it if the request fails:
         // waiting for the broker to echo it back makes the switch feel broken.
         paint(row, target);
         row.classList.add("is-pending");
 
-        fetch("/api/" + encodeURIComponent(id), {
-            method: "PUT",
-            body: target ? "true" : "false"
-        }).then(function (response) {
-            if (!response.ok) {
-                throw new Error("HTTP " + response.status);
-            }
-            // The reply is empty, but leaving it unread makes the browser cancel
-            // the body stream and log an aborted request for every toggle.
-            return response.text();
-        }).catch(function (err) {
-            var name = row.querySelector(".device-name").textContent;
-            log(name + ": switch failed, " + err.message);
+        function send() {
+            return fetch("/api/" + encodeURIComponent(id), {
+                method: "PUT",
+                body: target ? "true" : "false"
+            }).then(function (response) {
+                if (!response.ok) {
+                    throw new Error("HTTP " + response.status);
+                }
+                // The reply is empty, but leaving it unread makes the browser
+                // cancel the body stream and log an aborted request every time.
+                return response.text();
+            }).catch(function (err) {
+                log(row.querySelector(".device-name").textContent +
+                    ": switch failed, " + err.message);
 
-            // Only undo our own optimistic paint. If something already told us the
-            // real state, or the user has since clicked again, that is the truth
-            // now and this stale response must not overwrite it.
-            if (inFlight[id] !== token) {
-                return;
-            }
-            input.checked = !target;
-            paint(row, !target);
-        }).finally(function () {
-            if (inFlight[id] === token) {
-                delete inFlight[id];
-            }
-            row.classList.remove("is-pending");
-        });
+                // Only undo our own optimistic paint. If something already told us
+                // the real state, or the user has since clicked again, that is the
+                // truth now and this stale response must not overwrite it.
+                if (inFlight[id] !== token) {
+                    return;
+                }
+                input.checked = !target;
+                paint(row, !target);
+            }).finally(function () {
+                if (inFlight[id] === token) {
+                    delete inFlight[id];
+                }
+                queued[id]--;
+                if (queued[id] === 0) {
+                    row.classList.remove("is-pending");
+                }
+            });
+        }
+
+        chain[id] = (chain[id] || Promise.resolve()).then(send, send);
     });
 
     // --- Activity log ------------------------------------------------------
@@ -186,16 +211,41 @@
     // websocket only carries changes from the moment it is open. Everything in
     // between - the gap before the socket connects, and the whole of any outage -
     // is invisible to the page, so refetch the truth whenever the socket comes up.
+    var resyncSeq = 0;
+
     function resync() {
-        return fetch("/api/state").then(function (response) {
+        var seq = ++resyncSeq;
+        var seen = Object.assign(Object.create(null), epoch);
+
+        // The request itself must not hang forever: /api/state is served by the
+        // same handler chain as everything else, and a page waiting on it silently
+        // is worse than one that says so.
+        var abort = new AbortController();
+        var timer = setTimeout(function () {
+            abort.abort();
+        }, 10000);
+
+        return fetch("/api/state", { signal: abort.signal }).then(function (response) {
             if (!response.ok) {
                 throw new Error("HTTP " + response.status);
             }
             return response.json();
         }).then(function (states) {
+            // A newer resync is already in flight; this snapshot is older than the
+            // one that will replace it, so applying it would only flicker.
+            if (seq !== resyncSeq) {
+                return;
+            }
+
             Object.keys(states).forEach(function (id) {
+                // Skip a device with a request in flight, and one that something
+                // told us about after this snapshot was taken - a websocket event,
+                // or the user's own tap. Either is newer than what we asked for.
+                if (id in inFlight || (epoch[id] || 0) !== (seen[id] || 0)) {
+                    return;
+                }
                 var row = rowFor(id);
-                if (!row || id in inFlight) {
+                if (!row) {
                     return;
                 }
                 var state = !!states[id];
@@ -204,6 +254,8 @@
             });
         }).catch(function (err) {
             log("could not read device state: " + err.message);
+        }).finally(function () {
+            clearTimeout(timer);
         });
     }
 
