@@ -2,12 +2,15 @@ package frontend
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
+	"path"
 	"sort"
 	"sync"
 	"time"
@@ -32,8 +35,49 @@ var (
 
 	indexTemplate = template.Must(template.ParseFS(templateFS, "template/index.html"))
 	staticFiles   = must(fs.Sub(staticFS, "static"))
+	staticETags   = buildStaticETags()
 )
 
+// buildStaticETags derives an ETag from the content of every embedded static asset. embed.FS
+// reports a zero ModTime, which makes http.FileServer omit Last-Modified and therefore skip
+// conditional requests altogether; without a validator of our own every page load would
+// re-transfer all assets. Hashing the content rather than stamping a build time also keeps the
+// validator honest across upgrades: the ETag changes exactly when the bytes do.
+func buildStaticETags() map[string]string {
+	etags := make(map[string]string)
+	err := fs.WalkDir(staticFiles, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		content, err := fs.ReadFile(staticFiles, p)
+		if err != nil {
+			return err
+		}
+		etags["/"+p] = fmt.Sprintf(`"%x"`, sha256.Sum256(content))
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	return etags
+}
+
+// staticHandler serves the embedded static assets. Each response carries a content-derived ETag
+// so that http.ServeContent can answer a revalidating browser with 304 Not Modified. The assets
+// are served under fixed, unversioned URLs, so they are marked no-cache (cache, but revalidate)
+// rather than immutable: a new build must not be shadowed by a stale copy of hal.css.
+func staticHandler() http.Handler {
+	fileServer := http.FileServer(http.FS(staticFiles))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if etag, ok := staticETags[path.Clean("/"+r.URL.Path)]; ok {
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Cache-Control", "public, no-cache")
+		}
+		fileServer.ServeHTTP(w, r)
+	})
+}
+
+// must unwraps a (value, error) pair, panicking if err is non-nil.
 func must[T any](v T, err error) T {
 	if err != nil {
 		panic(err)
@@ -90,7 +134,7 @@ func Start(httpConfig config.Http) error {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/", homeHandler).Methods("GET")
-	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.FS(staticFiles))))
+	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", staticHandler()))
 	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
 	r.HandleFunc("/api/ws", wsHandler)
 
