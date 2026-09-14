@@ -1,6 +1,6 @@
 module github.com/mwuertinger/hal
 
-go 1.25
+go 1.25.0
 
 // A floor, not a pin: a newer local toolchain is used as-is, and
 // GOTOOLCHAIN=local ignores this line entirely. What it does guarantee is that
@@ -17,6 +17,6 @@ require (
 )
 
 require (
-	golang.org/x/net v0.44.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
 )
