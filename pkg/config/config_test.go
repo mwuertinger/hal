@@ -369,3 +369,26 @@ func TestNormaliseAllowedHosts(t *testing.T) {
 		t.Errorf("AllowedHosts = %q, want %q", c.Http.AllowedHosts, want)
 	}
 }
+
+// TestAllowedHostsRejectsAPort: the port is stripped from the incoming Host
+// before the comparison, so an entry carrying one silently never matches.
+func TestAllowedHostsRejectsAPort(t *testing.T) {
+	for _, host := range []string{"hal.example.com:8080", "http://hal.example.com", "hal.example.com/"} {
+		c := valid()
+		c.Http.AllowedHosts = []string{host}
+		err := validate(c)
+		if err == nil {
+			t.Errorf("validate() with allowed-hosts %q = nil, want an error", host)
+			continue
+		}
+		if !strings.Contains(err.Error(), "without a port") {
+			t.Errorf("validate() = %q, want it to explain the format", err)
+		}
+	}
+
+	c := valid()
+	c.Http.AllowedHosts = []string{"hal.example.com"}
+	if err := validate(c); err != nil {
+		t.Errorf("validate() with a plain host name = %v, want nil", err)
+	}
+}

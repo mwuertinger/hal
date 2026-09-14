@@ -30,10 +30,24 @@ const (
 	// TCP connection and then says nothing cannot hang startup indefinitely.
 	connectTimeout = 15 * time.Second
 
-	// publishTimeout bounds waiting for a QoS 1 PUBACK. A command that is not
-	// acknowledged within it is reported as failed, which the frontend turns
-	// into a switch that snaps back rather than a lie.
+	// publishTimeout bounds waiting for a QoS 1 PUBACK.
+	//
+	// An unacknowledged command is reported as failed, and the frontend snaps
+	// the switch back. Be clear about what that means: with QoS 1 there is no
+	// way to tell a command that never arrived from one that arrived and whose
+	// acknowledgement was lost, so the snap-back can itself be wrong - the lamp
+	// switched and the page says it did not. It self-corrects a moment later,
+	// when the device's own stat/<id>/POWER echo arrives and repaints the row.
+	// What the IsConnectionOpen check in Publish rules out is the worse case:
+	// a command reported as failed and then delivered minutes later.
 	publishTimeout = 5 * time.Second
+
+	// writeTimeout bounds paho's enqueue of an outbound packet, which happens
+	// before the token wait above is even reached. Left unset it defaults to
+	// 30 seconds, which made Publish's real worst case ~35s rather than the 5
+	// the constant above implies - and longer than any HTTP write deadline in
+	// front of it.
+	writeTimeout = 3 * time.Second
 
 	// subscribeTimeout bounds a single SUBSCRIBE round trip.
 	subscribeTimeout = 10 * time.Second
@@ -131,6 +145,7 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 		SetPassword(mqttConfig.Password).
 		SetTLSConfig(tlsConfig).
 		SetConnectTimeout(connectTimeout).
+		SetWriteTimeout(writeTimeout).
 		SetKeepAlive(keepAlive).
 		SetPingTimeout(keepAlive / 3).
 		// Every subscription is re-issued by onConnect, so there is nothing

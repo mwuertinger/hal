@@ -982,3 +982,83 @@ func TestBroadcasterSurvivesNoDevices(t *testing.T) {
 
 	waitClients(t, 0)
 }
+
+// TestStartWiresEverythingTogether covers the composition root. Every other
+// test in this file assembles the handler stack by hand, so the function that
+// assembles it in production was the one place none of them looked: the host
+// check could be dropped from it entirely, http.allowed-hosts could stop
+// reaching it, and the event fan-out could be removed, all without a single
+// failure.
+func TestStartWiresEverythingTogether(t *testing.T) {
+	waitClients(t, 0)
+
+	if err := Start(config.Http{
+		ListenAddress: "127.0.0.1:0",
+		AllowedHosts:  []string{"hal.example.com"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer Shutdown()
+
+	base := "http://" + listenAddr
+
+	request := func(host string) int {
+		req, err := http.NewRequest("GET", base+"/api/state", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if host != "" {
+			req.Host = host
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET /api/state with Host %q: %v", host, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// The host check is wired in...
+	if got := request("rebind.attacker.test"); got != http.StatusMisdirectedRequest {
+		t.Errorf("a foreign Host got %d, want 421: the rebinding guard is not wired into Start", got)
+	}
+	// ...and it is reading the configured allowlist, not an empty one.
+	if got := request("hal.example.com"); got != http.StatusOK {
+		t.Errorf("the allow-listed Host got %d, want 200: http.allowed-hosts does not reach hostCheck", got)
+	}
+	if got := request(""); got != http.StatusOK {
+		t.Errorf("an IP Host got %d, want 200", got)
+	}
+
+	// And a device event reaches a browser through the fan-out Start began.
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Scheme = "ws"
+	u.Path = "/api/ws"
+
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), http.Header{"Origin": {base}})
+	if err != nil {
+		t.Fatalf("websocket: %v", err)
+	}
+	defer conn.Close()
+	waitClients(t, 1)
+
+	testBroker.Deliver("stat/lamp1/POWER", "ON")
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		var event device.Event
+		if err := conn.ReadJSON(&event); err != nil {
+			t.Fatalf("no event reached the browser: Start did not begin the fan-out: %v", err)
+		}
+		if event.DeviceId == "" {
+			continue // a heartbeat
+		}
+		if event.DeviceId != "lamp1" {
+			t.Errorf("DeviceId = %q, want lamp1", event.DeviceId)
+		}
+		break
+	}
+}

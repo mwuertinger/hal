@@ -725,3 +725,22 @@ func TestSkipHostnameVerifyStillChecksKeyUsage(t *testing.T) {
 		t.Fatal("Connect() = nil: a certificate valid only for client authentication was accepted as a broker")
 	}
 }
+
+// TestFakeShutdownWithSharedChannel: a device subscribes to two topics on one
+// channel, so a Shutdown that walks the map without deduplicating closes it
+// twice. The real broker guards this; the Fake exists to behave like the real
+// broker.
+func TestFakeShutdownWithSharedChannel(t *testing.T) {
+	f := NewFake()
+	if _, err := f.Subscribe("stat/lamp1/POWER", "tele/lamp1/STATE"); err != nil {
+		t.Fatal(err)
+	}
+
+	f.Shutdown()
+	f.Shutdown() // and idempotent
+
+	// A delivery after shutdown must not send on a closed channel either.
+	if n := f.Deliver("stat/lamp1/POWER", "ON"); n != 0 {
+		t.Errorf("Deliver() after Shutdown() reached %d subscribers, want 0", n)
+	}
+}

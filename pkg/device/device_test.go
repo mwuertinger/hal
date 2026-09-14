@@ -37,8 +37,17 @@ func reset(t *testing.T, broker mqtt.Broker) {
 		}
 		devices = make(map[string]Device)
 		mu.Unlock()
+		// Bounded: a device wedged by the very bug these tests look for blocks
+		// here forever, which turns an assertion into a whole-binary timeout
+		// minutes later, pointing at the cleanup rather than at the fault.
 		for _, d := range devs {
-			d.Shutdown()
+			done := make(chan struct{})
+			go func() { d.Shutdown(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s: Shutdown() did not return; the device is wedged", d.ID())
+			}
 		}
 	})
 }
@@ -160,18 +169,34 @@ func TestMalformedNotificationsAreIgnored(t *testing.T) {
 // observer, so one consumer that stopped reading blocked LastKnownState() -
 // which every page load needs - and left the handler unable to see its own
 // shutdown channel.
+//
+// The deliveries are batched with a pause between them on purpose. Fired in one
+// burst they are dropped by the broker's own queue long before the observer
+// queue fills, so the blocking send never blocks and the test passes against
+// the very bug it is named for. Each batch has to be drained into the observer
+// before the next arrives, which is what lets the observer queue overflow.
 func TestSlowObserverDoesNotBlockTheDevice(t *testing.T) {
 	broker := mqtt.NewFake()
 	dev := registerOne(t, broker)
 
 	dev.Events() // never read from
 
-	for i := 0; i < observerQueue*3; i++ {
-		state := "ON"
-		if i%2 == 0 {
-			state = "OFF"
+	const batch = 16
+	for sent := 0; sent < observerQueue*3; sent += batch {
+		for i := 0; i < batch; i++ {
+			state := "ON"
+			if (sent+i)%2 == 0 {
+				state = "OFF"
+			}
+			broker.Deliver("stat/lamp1/POWER", state)
 		}
-		broker.Deliver("stat/lamp1/POWER", state)
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// If the broker dropped these instead of the observer, the observer queue
+	// never filled and this test proves nothing.
+	if broker.Dropped() > 0 {
+		t.Fatalf("%d notifications were dropped upstream, so the observer queue never filled", broker.Dropped())
 	}
 
 	done := make(chan bool, 1)

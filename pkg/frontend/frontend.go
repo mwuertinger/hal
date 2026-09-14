@@ -48,8 +48,11 @@ var (
 	// cannot turn a clean exit into a panic.
 	lifecycleMu sync.Mutex
 	srv         *http.Server
-	shutdown    chan interface{}
-	wg          sync.WaitGroup
+	// listenAddr is the address actually bound, which differs from the
+	// configured one whenever that names port 0.
+	listenAddr string
+	shutdown   chan interface{}
+	wg         sync.WaitGroup
 
 	staticFiles = must(fs.Sub(staticFS, "static"))
 	assets      = buildAssets()
@@ -306,15 +309,34 @@ func Start(httpConfig config.Http) error {
 	// The goroutine closes over its own reference rather than reading the
 	// package variable, which Shutdown clears.
 	server := &http.Server{
-		Handler:      hostCheck(router(), httpConfig.AllowedHosts),
-		Addr:         httpConfig.ListenAddress,
-		WriteTimeout: 5 * time.Second,
+		Handler: hostCheck(router(), httpConfig.AllowedHosts),
+		Addr:    httpConfig.ListenAddress,
+		// Longer than the broker publish timeout switchHandler can wait out.
+		// At five seconds the write deadline - armed when the request is read -
+		// expired at the same moment the handler produced its 500, so the
+		// status code it takes such care over was never delivered: the browser
+		// saw an empty reply instead.
+		WriteTimeout: 20 * time.Second,
 		ReadTimeout:  5 * time.Second,
 	}
+	// Bound here rather than inside the goroutine, so a port that is already
+	// taken - or denied by SocketBindAllow= in hal.service - is returned to the
+	// caller as a startup error. Left to ListenAndServe it surfaced as a
+	// log.Fatalf from a goroutine, after main had already logged "Server ready"
+	// and without device or broker shutdown running.
+	listener, err := net.Listen("tcp", httpConfig.ListenAddress)
+	if err != nil {
+		srv = nil
+		close(shutdown)
+		wg.Wait()
+		return fmt.Errorf("listen on %s: %w", httpConfig.ListenAddress, err)
+	}
+	listenAddr = listener.Addr().String()
+
 	srv = server
 
 	go func() {
-		err := server.ListenAndServe()
+		err := server.Serve(listener)
 
 		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server: %v", err)
@@ -645,7 +667,9 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 	case "false":
 		status = false
 	default:
-		log.Printf("invalid status: %s", string(body))
+		// %q for the same reason as the device id below: this is attacker-
+		// controlled and an unquoted newline forges a journal line.
+		log.Printf("invalid status: %q", string(body))
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}

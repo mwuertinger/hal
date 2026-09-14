@@ -100,9 +100,17 @@ func (f *Fake) Shutdown() {
 		return
 	}
 	f.closed = true
+
+	// Deduplicated, like the real broker's: one subscriber's topics share a
+	// channel, so walking the map without this closes it once per topic - and a
+	// device subscribes to two topics, so every device would panic here.
+	seen := make(map[chan Notification]bool, len(f.subs))
 	for _, channels := range f.subs {
 		for _, c := range channels {
-			close(c)
+			if !seen[c] {
+				seen[c] = true
+				close(c)
+			}
 		}
 	}
 	f.subs = nil
@@ -114,6 +122,12 @@ func (f *Fake) Shutdown() {
 func (f *Fake) Deliver(topic, msg string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.closed {
+		// The real deliver checks this too; without it a delivery after
+		// Shutdown sends on a closed channel.
+		return 0
+	}
 
 	n := Notification{Timestamp: time.Now(), Topic: topic, Msg: msg}
 	delivered := 0

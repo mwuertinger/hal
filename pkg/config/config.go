@@ -186,6 +186,16 @@ func validate(config *Config) error {
 		return fmt.Errorf("http.listen-address %q: %v", config.Http.ListenAddress, err)
 	}
 
+	for i, host := range config.Http.AllowedHosts {
+		// The port is stripped from the incoming Host before it is compared, so
+		// an entry carrying one can never match - and the symptom is a
+		// permanent 421 with nothing in the log to explain it. Easy to write,
+		// given http.listen-address directly above it takes a port.
+		if strings.ContainsAny(host, ":/") {
+			return fmt.Errorf("http.allowed-hosts[%d] %q: a host name only, without a port or scheme", i, host)
+		}
+	}
+
 	seen := make(map[string]int, len(config.Devices))
 	for i, d := range config.Devices {
 		if len(d.ID) < 1 {
