@@ -7,23 +7,24 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"path"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/mwuertinger/hal/pkg/config"
 	"github.com/mwuertinger/hal/pkg/device"
-	"github.com/pkg/errors"
 )
 
 //go:embed template/index.html
@@ -42,9 +43,16 @@ var staticFS embed.FS
 const wsWriteTimeout = 5 * time.Second
 
 var (
-	srv      *http.Server
-	shutdown chan interface{}
-	wg       sync.WaitGroup
+	// lifecycleMu makes Start and Shutdown safe to call in any order and more
+	// than once, so an early-exit path that shuts down before startup finished
+	// cannot turn a clean exit into a panic.
+	lifecycleMu sync.Mutex
+	srv         *http.Server
+	// listenAddr is the address actually bound, which differs from the
+	// configured one whenever that names port 0.
+	listenAddr string
+	shutdown   chan interface{}
+	wg         sync.WaitGroup
 
 	staticFiles = must(fs.Sub(staticFS, "static"))
 	assets      = buildAssets()
@@ -198,7 +206,12 @@ func buildAssetsFS(fsys fs.FS) (map[string]*staticAsset, error) {
 			return nil, fmt.Errorf("no content type pinned for %q; add %q to contentTypes", p, ext)
 		}
 
-		sum := sha256.Sum256(content)
+		// The content type is hashed along with the bytes. It is served under
+		// immutable for a year, so changing the type of an otherwise unchanged
+		// asset without changing its URL would leave every client that had
+		// already visited stuck with the old one - and browsers refuse a
+		// stylesheet served as the wrong type outright.
+		sum := sha256.Sum256(append([]byte(contentType+"\x00"), content...))
 		hash := hex.EncodeToString(sum[:])[:16]
 
 		out[p] = &staticAsset{
@@ -255,6 +268,10 @@ func staticHandler() http.Handler {
 		// StripPrefix has already removed "/static/", trailing slash included.
 		a, ok := byPath[path.Clean("/static/"+r.URL.Path)]
 		if !ok {
+			// Everything else in this handler is cacheable for a year, and a
+			// 404 is heuristically cacheable too. On a URL that never changes
+			// back, a cached one would be permanent.
+			w.Header().Set("Cache-Control", "no-store")
 			http.NotFound(w, r)
 			return
 		}
@@ -277,52 +294,177 @@ func must[T any](v T, err error) T {
 // Start starts the HTTP server listening on listenAddress in the format address:port. The function returns immediately
 // and calls log.Fatal() should an error occur.
 func Start(httpConfig config.Http) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
 	if srv != nil {
 		return errors.New("already started")
 	}
 
-	wsConnections = make(map[*wsClient]bool)
+	// The goroutine closes over its own reference rather than reading the
+	// package variable, which Shutdown clears.
+	server := &http.Server{
+		Handler: hostCheck(router(), httpConfig.AllowedHosts),
+		Addr:    httpConfig.ListenAddress,
+		// Longer than the broker publish timeout switchHandler can wait out.
+		// At five seconds the write deadline - armed when the request is read -
+		// expired at the same moment the handler produced its 500, so the
+		// status code it takes such care over was never delivered: the browser
+		// saw an empty reply instead.
+		WriteTimeout: 20 * time.Second,
+		ReadTimeout:  5 * time.Second,
+	}
+	// Bound here rather than inside the goroutine, so a port that is already
+	// taken - or denied by SocketBindAllow= in hal.service - is returned to the
+	// caller as a startup error. Left to ListenAndServe it surfaced as a
+	// log.Fatalf from a goroutine, after main had already logged "Server ready"
+	// and without device or broker shutdown running.
+	// Before anything is started, so a failure here has nothing to unwind:
+	// device.Events() registers an observer channel and a fan-in goroutine per
+	// device, and releasing those on the error path is easy to get subtly
+	// wrong. Nothing between here and there needs the broadcaster.
+	listener, err := net.Listen("tcp", httpConfig.ListenAddress)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", httpConfig.ListenAddress, err)
+	}
+	listenAddr = listener.Addr().String()
 
 	shutdown = make(chan interface{})
 	wg.Add(1)
+	go broadcast(device.Events())
+
+	srv = server
 
 	go func() {
-		eventChan := device.Events()
+		err := server.Serve(listener)
 
-		for {
-			select {
-			case event, ok := <-eventChan:
-				if !ok {
-					goto shutdown
-				}
-
-				log.Printf("New event: %v", event)
-
-				// Hand each client its event and move on. Writing here instead
-				// would make one unresponsive client everyone's problem: this
-				// goroutine is the only reader of device.Events(), and a write
-				// that blocks stops it draining, which backs up into
-				// processNotification while that holds the device lock - the
-				// same lock homeHandler and stateHandler need. Bounding the
-				// write only capped that at wsWriteTimeout per stalled client;
-				// not blocking at all removes it.
-				wsConnectionsMu.Lock()
-				for c := range wsConnections {
-					select {
-					case c.send <- event:
-					default:
-						log.Printf("WS %v: %d events behind, dropping", c.conn.RemoteAddr(), wsSendQueue)
-						delete(wsConnections, c)
-						close(c.send)
-					}
-				}
-				wsConnectionsMu.Unlock()
-			case <-shutdown:
-				goto shutdown
-			}
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server: %v", err)
 		}
+	}()
 
-	shutdown:
+	return nil
+}
+
+// router builds the route table. Separate from Start so that a test can serve
+// it without binding a port or starting the event fan-out.
+//
+// The patterns are net/http's own (Go 1.22): a method in the pattern restricts
+// the route to it, "GET" also matches HEAD, "{$}" pins the root to an exact
+// match rather than a catch-all prefix, and a path that matches no method
+// answers 405 with an Allow header. That last part is why /static/ names its
+// methods too - it used to serve the file body in reply to DELETE, and a
+// non-error response to an unsafe method makes a cache drop the entry that
+// content-addressed URLs exist to keep. It does not close that off entirely:
+// path canonicalisation happens before method matching, so POST /static//x
+// still gets a 307 naming the asset in Location. A cache MUST invalidate on
+// the target URI and only MAY on Location, so this is much narrower than
+// answering with the file - and it behaved the same under the previous router.
+//
+// Canonicalisation also answers 307 where gorilla/mux answered 301. Browsers
+// normalise ".." and "//" before sending, so nothing reachable changed, and 307
+// preserves the method.
+func router() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", homeHandler)
+	mux.Handle("GET /static/", http.StripPrefix("/static/", staticHandler()))
+	mux.HandleFunc("GET /api/state", stateHandler)
+	mux.HandleFunc("PUT /api/{device}", switchHandler)
+	mux.HandleFunc("GET /api/ws", wsHandler)
+	return mux
+}
+
+// hostCheck rejects a request whose Host header names a domain rather than this
+// machine.
+//
+// HAL has no authentication: being on the LAN is the credential. DNS rebinding
+// is the standard way around that - a page on a public domain whose DNS is
+// re-pointed at 192.168.x.x becomes same-origin with HAL as far as the browser
+// is concerned, and can then switch lamps and read the event stream despite the
+// same-origin policy and the websocket origin check. What it cannot do is
+// change the Host header the browser sends, which is the name the user typed.
+//
+// So: IP literals, localhost, single-label names and the usual LAN suffixes are
+// this machine; anything else is a domain, and is refused unless
+// http.allowed-hosts names it.
+func hostCheck(next http.Handler, allowed []string) http.Handler {
+	permitted := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		permitted[strings.ToLower(name)] = true
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !hostIsLocal(r.Host, permitted) {
+			log.Printf("refused request for host %q from %v", r.Host, r.RemoteAddr)
+			http.Error(w, "unrecognised Host", http.StatusMisdirectedRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// lanSuffixes are the domain suffixes reserved for, or conventionally used on,
+// local networks. Nobody can register a name under one of them, so nobody can
+// point one at HAL: that is the entire basis for trusting them.
+var lanSuffixes = []string{
+	".local", ".lan", ".home", ".home.arpa", ".internal", ".localhost", ".localdomain",
+}
+
+// lanNames are trusted in full, for a router that publishes LAN hosts under a
+// domain somebody really does own.
+//
+// Names and not suffixes, because .box is a delegated ICANN gTLD - it is in
+// the public suffix list and nic.box resolves - so trusting the TLD would hand
+// HAL to anyone willing to spend a few euros on a .box domain and point it at
+// 192.168.x.x, which is exactly the attack this function exists to stop.
+// fritz.box is worth naming: AVM holds it, 192.168.178.0/24 is the Fritz!Box
+// factory default, and a Fritz!Box publishes every LAN host as
+// <name>.fritz.box and hands that out as the DHCP search domain.
+var lanNames = []string{"fritz.box"}
+
+func hostIsLocal(host string, permitted map[string]bool) bool {
+	name := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		name = h
+	}
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+
+	if name == "" {
+		// HTTP/1.1 requires a Host header, and HTTP/2 synthesises one.
+		return false
+	}
+	if permitted[name] {
+		return true
+	}
+	// An IPv6 literal keeps its brackets when there is no port.
+	if net.ParseIP(strings.Trim(name, "[]")) != nil {
+		return true
+	}
+	if !strings.Contains(name, ".") {
+		// A single label - "raspberrypi", "localhost" - is a name from the
+		// local network or the hosts file. It is not proof of anything (a
+		// search domain can make one resolve, and a few TLDs answer at their
+		// apex), but a rebinding attacker needs a name they control, and they
+		// cannot register a label in the victim's own search domain.
+		return true
+	}
+	for _, suffix := range lanSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	for _, known := range lanNames {
+		if name == known || strings.HasSuffix(name, "."+known) {
+			return true
+		}
+	}
+	return false
+}
+
+// broadcast fans device events out to every connected browser. It owns the
+// only read of device.Events().
+func broadcast(eventChan <-chan device.Event) {
+	defer func() {
 		// Closing the queue ends each writer, and each writer closes its own
 		// connection - so nothing here has to wait on a socket.
 		wsConnectionsMu.Lock()
@@ -335,39 +477,65 @@ func Start(httpConfig config.Http) error {
 		wg.Done()
 	}()
 
-	r := mux.NewRouter()
-	r.HandleFunc("/", homeHandler).Methods("GET", "HEAD")
-	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", staticHandler()))
-	r.HandleFunc("/api/state", stateHandler).Methods("GET")
-	r.HandleFunc("/api/{device}", switchHandler).Methods("PUT")
-	r.HandleFunc("/api/ws", wsHandler)
+	for {
+		select {
+		case event, ok := <-eventChan:
+			if !ok {
+				// Every device has stopped - which with no devices configured
+				// is true from the start. Keep serving: browsers still connect,
+				// and the drain above still has to run at shutdown rather than
+				// during startup. A nil channel blocks forever in select.
+				eventChan = nil
+				continue
+			}
 
-	srv = &http.Server{
-		Handler:      r,
-		Addr:         httpConfig.ListenAddress,
-		WriteTimeout: 5 * time.Second,
-		ReadTimeout:  5 * time.Second,
-	}
+			log.Printf("New event: %v", event)
 
-	go func() {
-		err := srv.ListenAndServe()
-
-		if err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server: %v", err)
+			// Hand each client its event and move on. Writing here instead
+			// would make one unresponsive client everyone's problem: this
+			// goroutine is the only reader of device.Events(), and a write
+			// that blocks stops it draining, which backs up into
+			// processNotification while that holds the device lock - the
+			// same lock homeHandler and stateHandler need. Bounding the
+			// write only capped that at wsWriteTimeout per stalled client;
+			// not blocking at all removes it.
+			wsConnectionsMu.Lock()
+			for c := range wsConnections {
+				select {
+				case c.send <- event:
+				default:
+					log.Printf("WS %v: %d events behind, dropping", c.conn.RemoteAddr(), wsSendQueue)
+					wsFellBehind.Add(1)
+					delete(wsConnections, c)
+					close(c.send)
+				}
+			}
+			wsConnectionsMu.Unlock()
+		case <-shutdown:
+			return
 		}
-	}()
-
-	return nil
+	}
 }
 
 // Shutdown the server waiting at most 5 seconds for in-flight connections to terminate.
+// Calling it without a successful Start, or twice, does nothing.
 func Shutdown() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
+	if srv == nil {
+		return
+	}
+
+	server := srv
+	srv = nil
+
 	close(shutdown)
 	wg.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("frontend shutdown: %v", err)
 	}
 }
@@ -394,16 +562,40 @@ type homePage struct {
 }
 
 func homeHandler(w http.ResponseWriter, r *http.Request) {
+	page := buildHomePage(device.List())
+
+	// The page carries live device state, so it must never be cached - and a
+	// response with neither Cache-Control nor Last-Modified cannot be cached
+	// heuristically either, which is the only reason the markup stayed fresh
+	// while the stylesheet went stale.
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(200)
+	err := indexTemplate.Execute(w, &page)
+
+	if err != nil {
+		log.Printf("unable to execute template: %v", err)
+	}
+}
+
+// buildHomePage groups devices into rooms for the template.
+func buildHomePage(devices []device.Device) homePage {
 	rooms := make(map[string]*frontendRoom)
-	for _, d := range device.List() {
+	for _, d := range devices {
+		// Checked, like stateHandler's: the Device/Switch split exists so that
+		// a device need not be switchable, and an unchecked assertion here
+		// turned the first such device into a panic on every page load.
+		devSwitch, ok := d.(device.Switch)
+		if !ok {
+			continue
+		}
 		if _, ok := rooms[d.Location()]; !ok {
 			rooms[d.Location()] = &frontendRoom{
 				Name: d.Location(),
 			}
 		}
 		room := rooms[d.Location()]
-		devSwitch := d.(device.Switch)
-		room.Devices = append(rooms[d.Location()].Devices, frontendDevice{
+		room.Devices = append(room.Devices, frontendDevice{
 			ID:    d.ID(),
 			Name:  d.Name(),
 			State: devSwitch.LastKnownState(),
@@ -429,19 +621,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		page.OnCount += room.OnCount
 		page.Total += len(room.Devices)
 	}
-
-	// The page carries live device state, so it must never be cached - and a
-	// response with neither Cache-Control nor Last-Modified cannot be cached
-	// heuristically either, which is the only reason the markup stayed fresh
-	// while the stylesheet went stale.
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(200)
-	err := indexTemplate.Execute(w, &page)
-
-	if err != nil {
-		log.Printf("unable to execute template: %v", err)
-	}
+	return page
 }
 
 // stateHandler reports the last known state of every switch. The page renders its
@@ -463,8 +643,6 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func switchHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-
 	// The body is "true" or "false". ReadTimeout bounds how long a client may
 	// take to send one, but nothing bounded how much it could send.
 	r.Body = http.MaxBytesReader(w, r.Body, 64)
@@ -489,27 +667,31 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 	case "false":
 		status = false
 	default:
-		log.Printf("invalid status: %s", string(body))
+		// %q for the same reason as the device id below: this is attacker-
+		// controlled and an unquoted newline forges a journal line.
+		log.Printf("invalid status: %q", string(body))
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	deviceId := vars["device"]
+	deviceId := r.PathValue("device")
 	dev := device.Get(deviceId)
 	if dev == nil {
-		log.Printf("device not found: %s", deviceId)
+		log.Printf("device not found: %q", deviceId)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	switchDev, success := dev.(device.Switch)
 	if !success {
-		log.Printf("device %s is not a switch", deviceId)
+		log.Printf("device %q is not a switch", deviceId)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("Device: %s, Target state: %v", deviceId, status)
+	// %q: the id is a decoded path segment, so an unquoted one can carry a
+	// newline and forge a journal line.
+	log.Printf("Device: %q, Target state: %v", deviceId, status)
 	if err = switchDev.Switch(status); err != nil {
 		log.Printf("send command failed: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -524,6 +706,113 @@ func switchHandler(w http.ResponseWriter, r *http.Request) {
 // a client that has genuinely stopped reading is recognised quickly.
 const wsSendQueue = 64
 
+const (
+	// wsMaxClients caps concurrent websockets. A household has a handful of
+	// phones; without a ceiling, each connection costs an fd, two goroutines
+	// and two buffers until LimitNOFILE=1024 is reached, at which point the
+	// whole HTTP server stops accepting - and the process stays up, so systemd
+	// never restarts it.
+	wsMaxClients = 32
+
+	// wsReadLimit bounds one inbound frame. The page never sends anything, so
+	// this only has to be large enough for a close frame. Gorilla treats the
+	// default of 0 as unlimited, and ReadMessage buffers a whole message before
+	// it can be discarded, so a single client frame could otherwise be sized to
+	// exhaust the Pi's memory.
+	wsReadLimit = 512
+
+	// wsPongTimeout is how long a client may go without answering a ping.
+	wsPongTimeout = 90 * time.Second
+)
+
+// wsPingInterval detects a connection that died without a close frame - a phone
+// that walked out of wifi, a router that dropped the NAT entry. Without it the
+// only backstop is TCP keepalive, and the browser meanwhile keeps showing state
+// it is no longer being sent.
+const wsPingInterval = 30 * time.Second
+
+// upgrader replaces the package-level websocket.Upgrade, which is deprecated
+// and, more to the point, sets CheckOrigin to accept everything. Websockets are
+// exempt from the same-origin policy and from CORS preflight, so that let any
+// page the user happened to visit open this socket and read the event stream -
+// every lamp transition in the house, timestamped. The zero value's CheckOrigin
+// is a same-origin check, which is what this needs.
+var upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
+
+// writePump is the one goroutine allowed to write to a client's connection:
+// events from its queue, and a ping every pingInterval. It ends when the queue
+// is closed or a write fails, and closes the connection on its way out.
+//
+// pingInterval is a parameter rather than a constant read here so that a test
+// can drive it faster without writing to package state that live connections
+// are reading.
+func writePump(client *wsClient, pingInterval time.Duration) {
+	conn := client.conn
+
+	if pingInterval <= 0 {
+		// time.NewTicker panics on a non-positive interval, which the closure
+		// this was extracted from could not be handed.
+		pingInterval = wsPingInterval
+	}
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case event, ok := <-client.send:
+			if !ok {
+				dropClient(client)
+				// Nothing else closes the hijacked connection. Leaving it open
+				// leaks a file descriptor per disconnect - against
+				// LimitNOFILE=1024 in hal.service - and strands a client that
+				// closed cleanly in CLOSING, still waiting for the server half
+				// of the handshake, so its onclose never fires and it never
+				// reconnects. A client dropped for falling behind reaches this
+				// with its connection still perfectly healthy, so nothing else
+				// would ever close it.
+				conn.Close()
+				return
+			}
+			if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+				log.Printf("WS %v: SetWriteDeadline: %v", conn.RemoteAddr(), err)
+			}
+			if err := conn.WriteJSON(event); err != nil {
+				log.Printf("WS %v: WriteJSON: %v, dropping", conn.RemoteAddr(), err)
+				dropClient(client)
+				conn.Close()
+				return
+			}
+		case <-ticker.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
+				log.Printf("WS %v: ping: %v, dropping", conn.RemoteAddr(), err)
+				dropClient(client)
+				conn.Close()
+				return
+			}
+			if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
+				log.Printf("WS %v: SetWriteDeadline: %v", conn.RemoteAddr(), err)
+			}
+			if err := conn.WriteJSON(wsHeartbeat{Heartbeat: true}); err != nil {
+				log.Printf("WS %v: heartbeat: %v, dropping", conn.RemoteAddr(), err)
+				dropClient(client)
+				conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// wsHeartbeat is sent alongside each ping. The ping is for this end - a pong
+// resets the read deadline that reclaims a vanished client - but a browser
+// never surfaces either to JavaScript, so the page has no way to tell an idle
+// socket from a dead one. A lamp dashboard is idle almost all the time, so
+// without this the page either tears down healthy connections or trusts dead
+// ones. It is a distinct shape from an event, and the page ignores it beyond
+// noting that the connection is alive.
+type wsHeartbeat struct {
+	Heartbeat bool
+}
+
 // wsClient is one browser: its connection plus the queue feeding it. Only the
 // client's own writer goroutine touches the connection for writing, which is
 // what gorilla requires.
@@ -532,8 +821,20 @@ type wsClient struct {
 	send chan device.Event
 }
 
+// wsFellBehind counts clients dropped for falling wsSendQueue events behind.
+// It exists so a test can assert that this path - and not the write deadline
+// behind it, which reaches the same end state seconds later - is what dropped a
+// client. Timing cannot separate them: under -race on one core the drop was
+// measured at up to 3.5s against a 5s deadline, so any wall-clock bound either
+// flakes or overlaps the thing it has to exclude.
+var wsFellBehind atomic.Uint64
+
 var (
-	wsConnections   map[*wsClient]bool
+	// Allocated here rather than in Start, which assigned it without holding
+	// the mutex that guards every other access - harmless while Start ran
+	// exactly once before the first connection, and a data race the moment it
+	// did not. Shutdown empties the map, so a restart starts clean anyway.
+	wsConnections   = make(map[*wsClient]bool)
 	wsConnectionsMu sync.Mutex
 )
 
@@ -549,61 +850,84 @@ func dropClient(c *wsClient) {
 	}
 }
 
+// addClient registers a client unless the ceiling is already reached.
+func addClient(c *wsClient) bool {
+	wsConnectionsMu.Lock()
+	defer wsConnectionsMu.Unlock()
+	if len(wsConnections) >= wsMaxClients {
+		return false
+	}
+	wsConnections[c] = true
+	return true
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Upgrade(w, r, nil, 1024, 1024)
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("websocket.Upgrade: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
+		// Upgrader has already written the response - 400 for a bad handshake,
+		// 403 for a foreign origin. Writing another status here would both
+		// override the accurate one and, where the hijack already happened,
+		// log a write on a hijacked connection.
+		log.Printf("websocket upgrade from %v: %v", r.RemoteAddr, err)
 		return
 	}
+
+	conn.SetReadLimit(wsReadLimit)
 
 	client := &wsClient{conn: conn, send: make(chan device.Event, wsSendQueue)}
 
 	// Register before starting either goroutine. The other order leaves a window
 	// where a connection that dies immediately is not yet in the map, so the
-	// reader's dropClient finds nothing to do, the queue is never closed, and the
-	// writer parks on the range for the life of the process. A broadcast landing
+	// reader's dropClient finds nothing to do, the queue is never closed, and
+	// the writer holds the connection until its next ping fails. A broadcast landing
 	// in this window instead either buffers or takes the drop path, and a writer
 	// that then starts on an already-closed queue drains it and exits.
-	wsConnectionsMu.Lock()
-	wsConnections[client] = true
-	wsConnectionsMu.Unlock()
+	if !addClient(client) {
+		log.Printf("WS %v: refused, %d clients already connected", conn.RemoteAddr(), wsMaxClients)
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "too many clients"),
+			time.Now().Add(time.Second))
+		conn.Close()
+		return
+	}
 
 	log.Printf("New WS: %v", conn.RemoteAddr())
 
 	// Writer. Ends when the queue is closed, or when a write fails - a stalled
-	// client hits the deadline rather than blocking here forever.
-	go func() {
-		for event := range client.send {
-			if err := conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout)); err != nil {
-				log.Printf("WS %v: SetWriteDeadline: %v", conn.RemoteAddr(), err)
-			}
-			if err := conn.WriteJSON(event); err != nil {
-				log.Printf("WS %v: WriteJSON: %v, dropping", conn.RemoteAddr(), err)
-				break
-			}
-		}
-
-		dropClient(client)
-
-		// Nothing else closes the hijacked connection. Leaving it open leaks a
-		// file descriptor per disconnect - against LimitNOFILE=1024 in
-		// hal.service - and strands a client that closed cleanly in CLOSING,
-		// still waiting for the server half of the handshake, so its onclose
-		// never fires and it never reconnects.
-		conn.Close()
-	}()
+	// client hits the deadline rather than blocking here forever. It also owns
+	// the ping ticker, because gorilla allows only one writer at a time.
+	go writePump(client, wsPingInterval)
 
 	// Reader. The page never sends anything, so this exists to notice the
 	// connection going away.
-	go func() {
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				log.Printf("ReadMessage() error: %v, Removing WS: %v", err, conn.RemoteAddr())
-				dropClient(client)
-				conn.Close()
-				return
-			}
+	go readPump(client, wsPongTimeout)
+}
+
+// readPump watches for the connection going away - either by a read error, or
+// by the pong for one of writePump's pings failing to arrive within
+// pongTimeout. It is what reclaims a phone that left wifi without closing.
+//
+// pongTimeout is a parameter for the same reason writePump's interval is: a
+// test needs it short, and package state that live connections read is not the
+// place to put that.
+func readPump(client *wsClient, pongTimeout time.Duration) {
+	conn := client.conn
+
+	if pongTimeout <= 0 {
+		pongTimeout = wsPongTimeout
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	})
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			log.Printf("ReadMessage() error: %v, Removing WS: %v", err, conn.RemoteAddr())
+			dropClient(client)
+			conn.Close()
+			return
 		}
-	}()
+	}
 }

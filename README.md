@@ -23,6 +23,7 @@ required at runtime.
 binary is at `/usr/local/bin/hal` and that the config and its MQTT CA certificate are
 in `/etc/hal`.
 
+    cp hal.yaml.example hal.yaml && $EDITOR hal.yaml    # holds the MQTT password; gitignored
     useradd --system --no-create-home --shell /usr/sbin/nologin hal
     install -m 0755 hal-arm /usr/local/bin/hal          # hal-amd64 on non-ARM hosts
     install -d -m 0750 -o root -g hal /etc/hal
@@ -32,7 +33,23 @@ in `/etc/hal`.
     systemctl daemon-reload && systemctl enable --now hal
 
 See `hal.yaml.example` for the config format. `mqtt.ca-path` must point at the CA
-certificate installed above.
+certificate installed above; the broker's certificate is verified against it, so a
+self-signed broker certificate has to be its own CA here.
+
+HAL has no authentication: being on the LAN is the credential. To keep a public
+web page from using the browser of someone on that LAN as a proxy into it (DNS
+rebinding), the frontend only answers requests whose `Host` is an IP address, a
+single-label name such as `raspberrypi`, or a name under `.local`, `.lan`,
+`.home`, `.home.arpa`, `.internal`, `.localhost` or `.localdomain` — none of
+which anyone can register. `fritz.box` is allowed by name, because AVM routers
+publish LAN hosts under it; the `.box` TLD as a whole is not, since it is a
+real gTLD anybody can buy into. Reach HAL under any other domain name and it
+answers 421 until that name is listed in `http.allowed-hosts`. The
+authoritative lists are `lanSuffixes` and `lanNames` in
+`pkg/frontend/frontend.go`.
+
+There is no `ExecReload=`, and HAL handles only SIGINT and SIGTERM, so a config
+change needs `systemctl restart hal` rather than a reload.
 
 HAL needs no capabilities, no writable path and no devices, and the unit takes all of
 them away; `systemd-analyze security hal.service` scores it 1.0 ("OK"). The residual
@@ -50,6 +67,24 @@ Three directives are deployment-specific and worth checking before first start:
   `overlay`: raspi-config's Overlay File System option makes `/` an overlayfs, and the
   unit would then fail to start. btrfs, xfs and f2fs need the same treatment. The
   directive is inert unless `bpf` appears in `/sys/kernel/security/lsm`.
+
+The Pi has no real-time clock, so `hal.service` orders itself after
+`time-sync.target`. That ordering does nothing on its own: unless
+`systemd-time-wait-sync.service` is enabled, the target is reached immediately
+at boot. Enable it if you want HAL to wait for a correct clock:
+
+    systemctl enable --now systemd-time-wait-sync
+
+It matters when the broker's certificate has been reissued since the last clean
+shutdown, because timesyncd restores the clock from disk and the restored time
+predates the new certificate, which then reads as "not yet valid". HAL treats
+that as retryable rather than fatal in any case, so the unit recovers on its own
+either way; enabling the wait just avoids the failed attempts.
+
+A `.local` broker name will not resolve. The binary is built with `CGO_ENABLED=0`,
+and Go's own resolver does not speak mDNS even where `/etc/nsswitch.conf` lists
+`mdns4_minimal` — so `ping mosquitto.local` works from a shell while HAL reports
+`no such host`. Use an IP address, a name in unicast DNS, or an `/etc/hosts` entry.
 
 Listening on a port below 1024 takes more than granting `CAP_NET_BIND_SERVICE`: a
 capability held inside the unit's private user namespace does not authorize a bind

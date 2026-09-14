@@ -1,8 +1,15 @@
 mqtt:
   # Address of the MQTT broker. The connection is TLS.
   server:         mqtt.example.com:8883
-  # CA certificate used to verify the broker.
+  # CA certificate the broker's own certificate is verified against.
   ca-path:        /etc/hal/ca.crt
+  # Uncomment if the broker's certificate has no subjectAltName - common for
+  # long-lived certificates, since Go stopped honouring the Common Name in 1.15
+  # and such a certificate cannot be matched against any name. The chain is
+  # still verified against ca-path; what is given up is the check that the
+  # certificate names this particular broker. Reissuing the certificate with a
+  # subjectAltName is the real fix.
+  #skip-hostname-verify: true
   user:           hal
   password:       changeme
 
@@ -10,6 +17,13 @@ http:
   # Address the web frontend listens on. Must match SocketBindAllow= in
   # hal.service, which allows tcp:8080 by default.
   listen-address: :8080
+  # Only needed to reach HAL under a registrable domain name: IP addresses,
+  # single-label names, names under .local, .lan, .home, .home.arpa,
+  # .internal, .localhost or .localdomain, and fritz.box are always accepted.
+  # Anything else is refused, so that a public page cannot point its own domain
+  # at HAL and drive it through a visitor's browser.
+  #allowed-hosts:
+  #- hal.example.com
 
 # sonoff-mqtt-switch is currently the only supported device type. The id is the
 # Tasmota topic name: HAL publishes to cmnd/<id>/POWER and subscribes to

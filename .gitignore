@@ -1,3 +1,18 @@
 .idea/
-hal-*
-config/
+
+# Build outputs of build.sh.
+/hal-amd64
+/hal-arm
+
+# The deployment config holds the MQTT password, and the README's install
+# recipe has you create it right here in the clone. Unanchored and with a
+# wildcard, so a copy under config/ or an editor backup is covered too - the
+# example is exempted explicitly.
+hal.yaml*
+!hal.yaml.example
+# Anchored. Unanchored, "config/" also matches pkg/config/, which silently
+# makes every new file in the config package unaddable.
+/config/
+*.crt
+*.key
+*.pem
