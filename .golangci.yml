@@ -1,0 +1,25 @@
+version: "2"
+
+# The default set: errcheck, govet, ineffassign, staticcheck and unused.
+# Everything here is about which of their findings are worth failing a build
+# for, not about adding more of them.
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        # Closing a websocket on a path that is already giving up: there is
+        # nothing the caller could do with the error, and the alternative is a
+        # func literal per call site.
+        #
+        # Only the entries that actually silence something are listed. errcheck
+        # matches the static type at the call site, so an (io.Closer).Close
+        # entry would exempt nothing here - every Close in this repo is on a
+        # concrete type - while reading like a blanket permission.
+        - (*github.com/gorilla/websocket.Conn).Close
+  exclusions:
+    rules:
+      # A test that leaks a socket fails on its own; making every Close in a
+      # test check its error buys nothing and hides the assertions.
+      - path: _test\.go
+        linters:
+          - errcheck

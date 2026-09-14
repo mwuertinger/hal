@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # So a dependency advisory published after the last commit still surfaces.
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Only for pull requests. A push to master and the weekly run both resolve to
+  # refs/heads/master, so cancelling unconditionally lets a merge cancel the
+  # scheduled vulnerability scan, or leave an earlier commit with a cancelled
+  # result rather than a green one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    # The whole suite runs in seconds; a deadlock regression in the websocket or
+    # broker tests would otherwise hold the runner for the 6-hour default.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # The version comes from go.mod, the toolchain directive included, so
+          # CI builds with exactly what that file names. Note a release build
+          # does not: toolchain is a floor, and build.sh sets no GOTOOLCHAIN, so
+          # a newer local Go is used as-is.
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go mod tidy is a no-op
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race -shuffle=on -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        # shell: bash for pipefail. Without it a run: step gets -e only, so a
+        # failure on the left of the pipe is masked by tail succeeding - the
+        # same shape as the tee /dev/stdout bug this workflow replaced.
+        shell: bash
+        run: go tool cover -func=coverage.out | tail -1
+
+  arm:
+    name: ARMv6 target
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The Pi is what HAL actually runs on, and it is 32-bit. Building only for
+    # amd64 lets an int-width or alignment error reach a release build - which
+    # is the first time anyone would have run the ARM compiler at all.
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: arm
+      GOARM: "6"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -trimpath -ldflags="-s -w" -o hal-arm .
+
+      - name: Compile the tests
+        # -exec true compiles each test binary for ARM and does not run it,
+        # which is the most this runner can do for a foreign architecture.
+        run: go test -run XXX -exec true ./...
+
+      - name: Check the binary is what the Pi expects
+        run: |
+          file hal-arm
+          file hal-arm | grep -q "ELF 32-bit LSB .*ARM" || { echo "not an ARM binary"; exit 1; }
+          file hal-arm | grep -q "statically linked" || { echo "not statically linked"; exit 1; }
+          go version -m hal-arm | grep -q "GOARM=6" || { echo "GOARM=6 is not recorded"; exit 1; }
+
+      # Not on pull requests: the artifact would be a fork's build, published
+      # under this repository and downloadable by anyone. The build and the
+      # assertions above still run on every PR; only publishing is gated.
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: hal-arm
+          path: hal-arm
+          retention-days: 14
+          if-no-files-found: error
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.2
+
+  vulncheck:
+    name: Vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - name: govulncheck
+        # Reports only vulnerabilities the code actually calls, standard library
+        # included - which is most of HAL's attack surface, and which moves with
+        # the toolchain pinned in go.mod rather than with any dependency.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
