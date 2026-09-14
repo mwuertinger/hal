@@ -140,11 +140,11 @@ func TestTLSConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := tlsConfig(filepath.Join(dir, "missing.crt")); err == nil {
+	if _, err := tlsConfig(filepath.Join(dir, "missing.crt"), false); err == nil {
 		t.Error("tlsConfig() of a missing file = nil, want an error")
 	}
 
-	_, err := tlsConfig(garbage)
+	_, err := tlsConfig(garbage, false)
 	if err == nil {
 		t.Fatal("tlsConfig() of a non-PEM file = nil, want an error")
 	}
@@ -152,7 +152,7 @@ func TestTLSConfig(t *testing.T) {
 		t.Errorf("tlsConfig() = %q, want it to say the file holds no certificate", err)
 	}
 
-	cfg, err := tlsConfig(testCA(t, dir))
+	cfg, err := tlsConfig(testCA(t, dir), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,4 +552,52 @@ func TestSubscribeIgnoresARepeatedTopic(t *testing.T) {
 		t.Errorf("the message was delivered twice: %+v", n)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// TestSkipHostnameVerify covers the escape hatch for a broker certificate with
+// no subjectAltName, and - more importantly - that it still refuses a
+// certificate the configured CA did not sign. Skipping the name check must not
+// become skipping verification, which is what the code this replaced did.
+func TestSkipHostnameVerify(t *testing.T) {
+	t.Run("a certificate without a SAN is refused by default", func(t *testing.T) {
+		tb, caPath := startTestBrokerOpts(t, false)
+
+		err := New().Connect(config.Mqtt{Server: tb.Addr(), CaPath: caPath, User: "hal"})
+		if err == nil {
+			t.Fatal("Connect() = nil, want a certificate error")
+		}
+		if !errors.Is(err, ErrConfig) {
+			t.Errorf("Connect() = %v, want it to wrap ErrConfig", err)
+		}
+	})
+
+	t.Run("and accepted with skip-hostname-verify", func(t *testing.T) {
+		tb, caPath := startTestBrokerOpts(t, false)
+
+		b := New()
+		t.Cleanup(b.Shutdown)
+		if err := b.Connect(config.Mqtt{
+			Server: tb.Addr(), CaPath: caPath, User: "hal", SkipHostnameVerify: true,
+		}); err != nil {
+			t.Fatalf("Connect() with skip-hostname-verify: %v", err)
+		}
+		if tb.Connects() != 1 {
+			t.Errorf("broker saw %d connects, want 1", tb.Connects())
+		}
+	})
+
+	t.Run("but a certificate from another CA is still refused", func(t *testing.T) {
+		tb, _ := startTestBrokerOpts(t, false)
+		_, otherCA := serverCert(t, t.TempDir()) // a CA that signed nothing here
+
+		err := New().Connect(config.Mqtt{
+			Server: tb.Addr(), CaPath: otherCA, User: "hal", SkipHostnameVerify: true,
+		})
+		if err == nil {
+			t.Fatal("Connect() = nil: skipping the hostname check must not skip the chain check")
+		}
+		if !strings.Contains(err.Error(), "authority") && !strings.Contains(err.Error(), "certificate") {
+			t.Errorf("Connect() = %q, want a chain verification error", err)
+		}
+	})
 }

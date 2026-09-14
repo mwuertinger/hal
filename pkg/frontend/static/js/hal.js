@@ -205,9 +205,15 @@
     var reconcileTimers = Object.create(null);
 
     // How long to give a device to echo a command before asking the server who
-    // was right. Comfortably longer than a Tasmota round trip on a LAN, and
-    // short enough that a genuinely contradicted switch is corrected while the
-    // user is still looking at it.
+    // was right.
+    //
+    // Measured against a Tasmota echo: at 120ms and at 500ms the reconcile
+    // lands after the echo and only confirms what the event already painted.
+    // Above this value the old bounce returns, bounded by (echo - this). What
+    // it costs is the other case: a switch genuinely contradicted by someone
+    // else keeps showing what the user asked for for this long before it is
+    // corrected. Raising it buys margin against a slow lamp and pays for it
+    // there.
     var RECONCILE_DELAY = 1000;
 
     function supersede(id, state) {
@@ -512,6 +518,13 @@
     // rows that stopped updating, so returning to the tab checks the age of
     // this rather than trusting socketOpen.
     var lastContact = 0;
+
+    // The server sends a heartbeat every wsPingInterval (30s), so a healthy
+    // socket proves itself twice inside this window: one lost heartbeat leaves
+    // the age at exactly 60s and the test below is strictly greater, so it
+    // takes two consecutive losses - 60s of real silence - to declare the
+    // socket dead. That is one heartbeat of slack, which is the minimum worth
+    // having: shortening the interval or lengthening this window widens it.
     var STALE_AFTER = 60000;
 
     // reconnectNow reconnects on the next tick, for when something has just

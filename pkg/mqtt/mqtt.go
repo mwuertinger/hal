@@ -115,9 +115,13 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 		return errors.New("already connected")
 	}
 
-	tlsConfig, err := tlsConfig(mqttConfig.CaPath)
+	tlsConfig, err := tlsConfig(mqttConfig.CaPath, mqttConfig.SkipHostnameVerify)
 	if err != nil {
 		return err
+	}
+	if mqttConfig.SkipHostnameVerify {
+		log.Printf("MQTT: mqtt.skip-hostname-verify is set - the broker's certificate chain is "+
+			"verified against %s, but not that it names %s", mqttConfig.CaPath, mqttConfig.Server)
 	}
 
 	opts := paho.NewClientOptions().
@@ -185,7 +189,7 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 // pool is the whole point of mqtt.ca-path, and verification against it is on:
 // this connection carries the broker password, and the LAN it crosses is
 // exactly where an attacker able to answer for the broker's address would be.
-func tlsConfig(caPath string) (*tls.Config, error) {
+func tlsConfig(caPath string, skipHostnameVerify bool) (*tls.Config, error) {
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: unable to read mqtt.ca-path: %w", ErrConfig, err)
@@ -199,7 +203,51 @@ func tlsConfig(caPath string) (*tls.Config, error) {
 		return nil, fmt.Errorf("%w: mqtt.ca-path %q contains no PEM certificate", ErrConfig, caPath)
 	}
 
-	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
+	config := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if !skipHostnameVerify {
+		return config, nil
+	}
+
+	// Go has ignored the Common Name field since 1.15, so a certificate with no
+	// subjectAltName cannot be matched against any name - which is the state of
+	// more than one long-lived broker certificate issued before that was
+	// enforced. Turning the standard verification off is the only way to reach
+	// the handshake at all, so the chain check is done here instead of being
+	// given up with it: InsecureSkipVerify disables Go's checks, and
+	// VerifyPeerCertificate puts the part that matters back.
+	//
+	// What is actually lost is the binding between the certificate and this
+	// host. A certificate signed by the configured CA for some other name is
+	// accepted here, where it would otherwise be refused.
+	config.InsecureSkipVerify = true
+	config.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("the broker presented no certificate")
+		}
+
+		certs := make([]*x509.Certificate, 0, len(rawCerts))
+		for _, raw := range rawCerts {
+			cert, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return fmt.Errorf("parsing the broker certificate: %w", err)
+			}
+			certs = append(certs, cert)
+		}
+
+		intermediates := x509.NewCertPool()
+		for _, cert := range certs[1:] {
+			intermediates.AddCert(cert)
+		}
+
+		_, err := certs[0].Verify(x509.VerifyOptions{
+			Roots:         pool,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		})
+		return err
+	}
+
+	return config, nil
 }
 
 // certificateProblem reports whether err is the broker's certificate failing

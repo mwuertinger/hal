@@ -59,9 +59,14 @@ func serveTestBroker(ln net.Listener) *testBroker {
 // exercised rather than bypassed.
 func startTestBroker(t *testing.T) (*testBroker, string) {
 	t.Helper()
+	return startTestBrokerOpts(t, true)
+}
+
+func startTestBrokerOpts(t *testing.T, withSAN bool) (*testBroker, string) {
+	t.Helper()
 
 	dir := t.TempDir()
-	cert, caPath := serverCert(t, dir)
+	cert, caPath := serverCertOpts(t, dir, withSAN)
 
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -78,6 +83,14 @@ func startTestBroker(t *testing.T) (*testBroker, string) {
 // path of a CA file containing it.
 func serverCert(t *testing.T, dir string) (tls.Certificate, string) {
 	t.Helper()
+	return serverCertOpts(t, dir, true)
+}
+
+// serverCertOpts can leave the subjectAltName out, which is the shape of a
+// broker certificate issued before Go stopped honouring the Common Name - and
+// the shape of the one this is deployed against.
+func serverCertOpts(t *testing.T, dir string, withSAN bool) (tls.Certificate, string) {
+	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -91,8 +104,10 @@ func serverCert(t *testing.T, dir string) (tls.Certificate, string) {
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 		BasicConstraintsValid: true,
+	}
+	if withSAN {
+		tmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1")}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {

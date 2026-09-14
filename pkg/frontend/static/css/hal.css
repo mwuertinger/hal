@@ -58,6 +58,11 @@
        nor the on orange reaches that against a white card. */
     --switch-off: #d3d8e0;
     --switch-edge: #7f8894;
+    /* The on-state edge is a separate token from --on-text: reusing that one
+       made the border exactly the colour of the fill it sits on in dark mode,
+       so the dashed pending state was invisible on the one control it
+       describes. 5.47:1 against the card, 2.09:1 against the fill. */
+    --switch-edge-on: #9a5a00;
     --live: #1a9c5b;
     --live-halo: rgba(26, 156, 91, 0.22);
     --down: #d1453b;
@@ -84,6 +89,10 @@
         --on-edge: rgba(255, 179, 64, 0.35);
         --switch-off: #313a45;
         --switch-edge: #6b7684;
+        /* The card colour: 9.70:1 against the orange fill, while the fill
+           itself carries 9.70:1 against the card, so the control keeps its
+           boundary and the dashes are visible. */
+        --switch-edge-on: #161b22;
         --live: #3fb950;
         --live-halo: rgba(63, 185, 80, 0.22);
         --down: #f85149;
@@ -442,7 +451,7 @@ main {
 
 input:checked + .slider {
     background: var(--on);
-    border-color: var(--on-text);
+    border-color: var(--switch-edge-on);
 }
 
 input:disabled + .slider {

@@ -24,6 +24,17 @@ type Mqtt struct {
 	CaPath   string `yaml:"ca-path"`
 	User     string
 	Password string
+
+	// SkipHostnameVerify keeps the certificate chain check against CaPath but
+	// drops the check that the certificate names the host being connected to.
+	// It exists for a broker whose certificate predates the requirement: Go has
+	// ignored the Common Name field since 1.15, so a certificate with no
+	// subjectAltName cannot be verified against any name at all.
+	//
+	// It is a real reduction: with it, any certificate signed by that CA is
+	// accepted for this broker, not just the broker's own. Reissuing the
+	// certificate with a subjectAltName is the fix; this is the stopgap.
+	SkipHostnameVerify bool `yaml:"skip-hostname-verify"`
 }
 
 type Http struct {
