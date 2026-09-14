@@ -1,4 +1,4 @@
-[![Build Status](https://circleci.com/gh/mwuertinger/hal.png?style=shield&circle-token=:circle-token)](https://circleci.com/gh/mwuertinger/hal)
+[![CI](https://github.com/mwuertinger/hal/actions/workflows/ci.yml/badge.svg)](https://github.com/mwuertinger/hal/actions/workflows/ci.yml)
 # HAL - Home Automation Link
 Simple home automation application written in Go.
 
@@ -93,6 +93,27 @@ a reverse proxy in front of the unprivileged port, or
 `sysctl net.ipv4.ip_unprivileged_port_start=80`. To bind directly you must remove
 `PrivateUsers=yes`, add `CAP_NET_BIND_SERVICE` to both `AmbientCapabilities=` and
 `CapabilityBoundingSet=`, and update `SocketBindAllow=`.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `master` and every pull
+request, and weekly so that an advisory published after the last commit still
+surfaces:
+
+- **Build and test** — `gofmt`, `go mod tidy` leaves no diff, `go vet`,
+  `go build`, and `go test -race -shuffle=on` with a coverage summary.
+- **ARMv6 target** — `go vet` and a build for the architecture the Pi actually
+  runs, plus compiling the test binaries for it. This is the only job that
+  would catch a 32-bit-only error before a release; on pushes to `master` it
+  also uploads the `hal-arm` binary as an artifact.
+- **Lint** — golangci-lint, pinned, configured by `.golangci.yml`.
+- **Vulnerabilities** — `govulncheck`, which reports only what the code
+  actually calls, standard library included.
+
+The Go version comes from `go.mod` in every job, the `toolchain` directive
+included, so CI builds with exactly the version that file names. A release
+build is not pinned that way: `toolchain` is a floor, and `build.sh` sets no
+`GOTOOLCHAIN`, so a newer Go on the builder's PATH is used as-is.
 
 ## Vendored frontend assets
 
