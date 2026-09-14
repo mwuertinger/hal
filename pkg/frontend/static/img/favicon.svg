@@ -1,14 +1,24 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
   <!--
-    The HAL 9000 lens. Kept byte-identical to the brand mark inlined in
-    template/index.html, so the tab and the topbar cannot drift apart.
+    The HAL 9000 lens. Same geometry and gradient stops as the brand mark
+    inlined in template/index.html, which TestBrandMarkMatchesFavicon holds in
+    step.
 
     Unlike the bulb this replaced, there are no prefers-color-scheme rules: a
-    lens is the same colour whatever the browser chrome around it is, and the
-    dark bezel carries its own contrast against both.
+    lens is the same colour whatever the browser chrome around it is. What
+    carries it against a dark tab strip is the hot centre of the element, not
+    the bezel - that is 1.06:1 against the page's own dark topbar. The rim
+    earns its place by keeping the bezel from reading as a hole in the bar, not
+    by supplying contrast.
 
     Gradient ids are prefixed because the same markup is inlined into the page,
     where a bare id like "lens" would sit in the document's id namespace.
+
+    The path named above deliberately carries no leading slash: buildAssetsFS
+    rejects any non-stylesheet asset whose bytes contain the prefix these files
+    are served under, and that rejection is a panic during package
+    initialisation - so spelling a served URL in this comment would stop the
+    binary from starting.
   -->
   <defs>
     <radialGradient id="halLens">

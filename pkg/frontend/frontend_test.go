@@ -1,6 +1,7 @@
 package frontend
 
 import (
+	"io/fs"
 	"regexp"
 	"strings"
 	"testing"
@@ -201,5 +202,64 @@ func TestAssetURL(t *testing.T) {
 	}
 	if _, err := assetURL("css/nope.css"); err == nil {
 		t.Error("assetURL of an unknown asset should fail, so a typo cannot reach a template")
+	}
+}
+
+// svgShape matches the drawing elements of the HAL 9000 lens: everything that
+// decides what the mark looks like, and nothing that legitimately differs
+// between its two copies - root attributes, indentation, the prose around it.
+var svgShape = regexp.MustCompile(`<(?:radialGradient|stop|circle|ellipse)\b[^>]*>`)
+
+var xmlComment = regexp.MustCompile(`(?s)<!--.*?-->`)
+
+var brandMark = regexp.MustCompile(`(?s)<svg class="brand-mark".*?</svg>`)
+
+// TestBrandMarkMatchesFavicon keeps the two copies of the lens in step.
+//
+// The mark exists twice by necessity: inlined in the page, because it has to be
+// there before first paint, and as a standalone file, because that is what a
+// <link rel=icon> can point at. Nothing else stops one from being edited alone,
+// and the failure is quiet - a tab icon that no longer matches the topbar, on a
+// page nobody reloads with the tab strip in view.
+//
+// It compares the drawing elements rather than the bytes. The two wrappers are
+// genuinely different documents - one carries xmlns, the other a class and
+// aria-hidden - so "identical" can only mean identical where it matters.
+func TestBrandMarkMatchesFavicon(t *testing.T) {
+	page, err := templateFS.ReadFile("template/index.html")
+	if err != nil {
+		t.Fatalf("read template: %v", err)
+	}
+	inline := brandMark.Find(page)
+	if inline == nil {
+		// Worth failing loudly rather than passing vacuously: a renamed class
+		// would otherwise compare an empty list against an empty list.
+		t.Fatal(`no <svg class="brand-mark"> in template/index.html`)
+	}
+
+	icon, err := fs.ReadFile(staticFiles, "img/favicon.svg")
+	if err != nil {
+		t.Fatalf("read favicon: %v", err)
+	}
+
+	shapes := func(b []byte) []string {
+		var out []string
+		for _, m := range svgShape.FindAll(xmlComment.ReplaceAll(b, nil), -1) {
+			out = append(out, strings.Join(strings.Fields(string(m)), " "))
+		}
+		return out
+	}
+
+	got, want := shapes(inline), shapes(icon)
+	if len(got) == 0 {
+		t.Fatal("the brand mark has no drawing elements")
+	}
+	if len(got) != len(want) {
+		t.Fatalf("brand mark has %d drawing elements, favicon.svg has %d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("element %d differs:\n  index.html:   %s\n  favicon.svg:  %s", i, got[i], want[i])
+		}
 	}
 }
