@@ -1,11 +1,58 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-width="2.1"
-     stroke-linecap="round" stroke-linejoin="round">
-  <style>
-    /* Matches --on in hal.css. The darker light-mode value keeps the mark legible
-       against the white tab strip; the lighter one is for dark browser chrome. */
-    :root { stroke: #e8890c; }
-    @media (prefers-color-scheme: dark) { :root { stroke: #ffb340; } }
-  </style>
-  <path d="M9 18h6M10 21h4"/>
-  <path d="M12 3a6 6 0 0 0-3.6 10.8c.5.4.8.9.9 1.5l.1.7h5.2l.1-.7c.1-.6.4-1.1.9-1.5A6 6 0 0 0 12 3Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!--
+    The HAL 9000 lens. Same geometry and gradient stops as the brand mark
+    inlined in template/index.html, which TestBrandMarkMatchesFavicon holds in
+    step.
+
+    Unlike the bulb this replaced, there are no prefers-color-scheme rules: a
+    lens is the same colour whatever the browser chrome around it is. What
+    carries it against a dark tab strip is the hot centre of the element, not
+    the bezel - that is 1.06:1 against the page's own dark topbar. The rim
+    earns its place by keeping the bezel from reading as a hole in the bar, not
+    by supplying contrast.
+
+    Gradient ids are prefixed because the same markup is inlined into the page,
+    where a bare id like "lens" would sit in the document's id namespace.
+
+    The path named above deliberately carries no leading slash: buildAssetsFS
+    rejects any non-stylesheet asset whose bytes contain the prefix these files
+    are served under, and that rejection is a panic during package
+    initialisation - so spelling a served URL in this comment would stop the
+    binary from starting.
+  -->
+  <defs>
+    <radialGradient id="halLens">
+      <stop offset="0%"   stop-color="#ffc45c"/>
+      <stop offset="22%"  stop-color="#ff5a1e"/>
+      <stop offset="52%"  stop-color="#e01c07"/>
+      <stop offset="80%"  stop-color="#8e1105"/>
+      <stop offset="100%" stop-color="#3d0602"/>
+    </radialGradient>
+    <radialGradient id="halPupil">
+      <stop offset="0%"   stop-color="#fffaec"/>
+      <stop offset="42%"  stop-color="#ffe9a8"/>
+      <stop offset="72%"  stop-color="#ffb43c" stop-opacity="0.72"/>
+      <stop offset="100%" stop-color="#ff8a1e" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="halSheen">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.5"/>
+      <stop offset="55%"  stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Bezel. The rim is not decoration: a pure black disc on the dark topbar
+       (#11161d) has no edge at all. -->
+  <circle cx="12" cy="12" r="11.1" fill="#0c0e11" stroke="#42484f" stroke-width="0.7"/>
+  <!-- Inner housing: the recess the element sits in. -->
+  <circle cx="12" cy="12" r="8.5" fill="#181b20"/>
+  <!-- The lens element itself, hot inside to near-black at the edge. -->
+  <circle cx="12" cy="12" r="6.1" fill="url(#halLens)"/>
+  <!-- Pupil. Fades to transparent so it blooms into the element rather than
+       sitting on top of it as a hard dot. -->
+  <circle cx="12" cy="12" r="2.5" fill="url(#halPupil)"/>
+  <!-- Sheen: a soft highlight on the upper left, the one cue that reads as
+       glass. Soft-edged on purpose - a hard-edged crescent looks like a
+       clipping artifact once the mark is drawn larger than a favicon. -->
+  <ellipse cx="9.5" cy="8.7" rx="3.9" ry="2.6" transform="rotate(-38 9.5 8.7)" fill="url(#halSheen)"/>
 </svg>
