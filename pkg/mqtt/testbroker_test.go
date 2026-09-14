@@ -91,6 +91,13 @@ func serverCert(t *testing.T, dir string) (tls.Certificate, string) {
 // the shape of the one this is deployed against.
 func serverCertOpts(t *testing.T, dir string, withSAN bool) (tls.Certificate, string) {
 	t.Helper()
+	return serverCertAt(t, dir, withSAN, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+}
+
+// serverCertAt can place the validity window in the past or the future, which
+// is what a Pi with no real-time clock sees before timesyncd corrects it.
+func serverCertAt(t *testing.T, dir string, withSAN bool, notBefore, notAfter time.Time) (tls.Certificate, string) {
+	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -99,8 +106,8 @@ func serverCertOpts(t *testing.T, dir string, withSAN bool) (tls.Certificate, st
 	tmpl := x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "hal test broker"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},

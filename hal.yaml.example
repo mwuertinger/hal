@@ -3,6 +3,13 @@ mqtt:
   server:         mqtt.example.com:8883
   # CA certificate the broker's own certificate is verified against.
   ca-path:        /etc/hal/ca.crt
+  # Uncomment if the broker's certificate has no subjectAltName - common for
+  # long-lived certificates, since Go stopped honouring the Common Name in 1.15
+  # and such a certificate cannot be matched against any name. The chain is
+  # still verified against ca-path; what is given up is the check that the
+  # certificate names this particular broker. Reissuing the certificate with a
+  # subjectAltName is the real fix.
+  #skip-hostname-verify: true
   user:           hal
   password:       changeme
 

@@ -167,6 +167,12 @@ func (s *broker) Connect(mqttConfig config.Mqtt) error {
 	if err := token.Error(); err != nil {
 		client.Disconnect(0)
 		s.client = nil
+		if hostnameProblem(err) {
+			// The one certificate failure with a documented way forward, and
+			// the operator has no way to guess the key from the error alone.
+			return fmt.Errorf("%w: connect to %s failed: %w (if the broker's certificate has no "+
+				"subjectAltName, see mqtt.skip-hostname-verify)", ErrConfig, mqttConfig.Server, err)
+		}
 		if certificateProblem(err) {
 			// A certificate that does not chain to mqtt.ca-path, or whose SAN
 			// does not cover mqtt.server, fails identically on every retry.
@@ -250,17 +256,34 @@ func tlsConfig(caPath string, skipHostnameVerify bool) (*tls.Config, error) {
 	return config, nil
 }
 
-// certificateProblem reports whether err is the broker's certificate failing
-// to verify, rather than the broker being unreachable.
+// certificateProblem reports whether err is the broker's certificate being
+// wrong in a way that will still be wrong on the next attempt - as opposed to
+// the broker being unreachable, or the clock being behind.
+//
+// The order matters. x509 reports "has expired" and "is not yet valid" with the
+// same Expired reason, and this runs on a Raspberry Pi, which has no real-time
+// clock: on a cold boot HAL can reach the broker before timesyncd has corrected
+// the date, and a certificate issued today then reads as not yet valid.
+// Retrying fixes that in seconds. Exit 78 does not - it stops the unit, and the
+// house stays dark until somebody logs in. So the validity window is checked
+// first and excluded, before the catch-all below, which would otherwise match
+// it right back.
 func certificateProblem(err error) bool {
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &invalid) {
+		return invalid.Reason != x509.Expired
+	}
+
 	var unknownAuthority x509.UnknownAuthorityError
 	var hostname x509.HostnameError
-	var invalid x509.CertificateInvalidError
-	var alert *tls.CertificateVerificationError
-	return errors.As(err, &unknownAuthority) ||
-		errors.As(err, &hostname) ||
-		errors.As(err, &invalid) ||
-		errors.As(err, &alert)
+	return errors.As(err, &unknownAuthority) || errors.As(err, &hostname)
+}
+
+// hostnameProblem reports whether err is specifically the certificate not
+// naming the host it was fetched from.
+func hostnameProblem(err error) bool {
+	var hostname x509.HostnameError
+	return errors.As(err, &hostname)
 }
 
 // clientID identifies this instance to the broker. It must not be the username:
@@ -502,11 +525,38 @@ func (s *broker) Subscribe(topics ...string) (<-chan Notification, error) {
 
 	c := make(chan Notification, notificationQueue)
 
+	fresh, err := s.register(topics, c)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, topic := range fresh {
+		if err := s.subscribe(s.client, topic); err != nil {
+			s.unsubscribe(topics, c)
+			return nil, fmt.Errorf("subscribe to %s: %w", topic, err)
+		}
+	}
+
+	return c, nil
+}
+
+// register adds c to the subscriber list of every topic and reports which of
+// them nobody was subscribed to yet.
+//
+// Split out so the locked section can use defer. Subscribe does its broker I/O
+// outside the lock, so it cannot simply defer the unlock itself - and an
+// explicit Unlock is not equivalent: a panic in here would otherwise leave the
+// broker mutex held for the life of the process, which wedges delivery,
+// shutdown and every later subscription while the daemon carries on looking
+// healthy.
+func (s *broker) register(topics []string, c chan Notification) ([]string, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.closed {
-		s.mu.Unlock()
 		return nil, errors.New("broker is shut down")
 	}
+
 	fresh := make([]string, 0, len(topics))
 	seen := make(map[string]bool, len(topics))
 	for _, topic := range topics {
@@ -521,16 +571,7 @@ func (s *broker) Subscribe(topics ...string) (<-chan Notification, error) {
 		}
 		s.subs[topic] = append(s.subs[topic], c)
 	}
-	s.mu.Unlock()
-
-	for _, topic := range fresh {
-		if err := s.subscribe(s.client, topic); err != nil {
-			s.unsubscribe(topics, c)
-			return nil, fmt.Errorf("subscribe to %s: %w", topic, err)
-		}
-	}
-
-	return c, nil
+	return fresh, nil
 }
 
 // unsubscribe removes one channel again, so a failed Subscribe does not leave

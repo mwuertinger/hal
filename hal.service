@@ -4,6 +4,24 @@ Documentation=https://github.com/mwuertinger/hal
 After=network-online.target
 Wants=network-online.target
 
+# A Raspberry Pi has no real-time clock. systemd-timesyncd restores the clock
+# from disk at boot, so it is never wildly wrong - but it is the time of the
+# last shutdown, which is in the past. If the broker's certificate was reissued
+# since then, it reads as "not yet valid" until timesyncd corrects the date, and
+# HAL's first connect can easily happen inside that window.
+#
+# Note this ordering is inert unless systemd-time-wait-sync.service is enabled:
+# without it nothing delays time-sync.target and the target is reached
+# immediately. Enable it (systemctl enable systemd-time-wait-sync) to make this
+# do anything.
+#
+# Wants=, deliberately not Requires=: if NTP is unreachable the sync unit fails
+# or times out, and a house with no internet should still have working lamps.
+# HAL treats a clock-related certificate failure as retryable for the same
+# reason, so this is the belt to that braces rather than the only protection.
+After=time-sync.target
+Wants=time-sync.target
+
 # A broker that is down for hours is a normal condition for this service (see
 # Restart= below), so disable the start rate limit rather than let repeated
 # restarts leave the unit dead.

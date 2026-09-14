@@ -1,8 +1,17 @@
 package mqtt
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -600,4 +609,119 @@ func TestSkipHostnameVerify(t *testing.T) {
 			t.Errorf("Connect() = %q, want a chain verification error", err)
 		}
 	})
+}
+
+// TestClockSkewIsNotAConfigError: x509 reports "has expired" and "is not yet
+// valid" with the same reason, and this runs on a Raspberry Pi, which has no
+// real-time clock. HAL can reach the broker before timesyncd has corrected the
+// date, at which point a certificate issued today reads as not yet valid.
+// Classifying that as a configuration error stops the unit - and the house
+// stays dark until somebody logs in - where retrying would have fixed it in
+// seconds.
+func TestClockSkewIsNotAConfigError(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		notBefore, notAfter time.Time
+	}{
+		{"not yet valid", time.Now().Add(24 * time.Hour), time.Now().Add(48 * time.Hour)},
+		{"expired", time.Now().Add(-48 * time.Hour), time.Now().Add(-24 * time.Hour)},
+	} {
+		for _, skip := range []bool{false, true} {
+			name := tc.name
+			if skip {
+				name += ", skip-hostname-verify"
+			}
+			t.Run(name, func(t *testing.T) {
+				dir := t.TempDir()
+				cert, caPath := serverCertAt(t, dir, true, tc.notBefore, tc.notAfter)
+
+				raw, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				ln := tls.NewListener(raw, &tls.Config{Certificates: []tls.Certificate{cert}})
+				tb := serveTestBroker(ln)
+				t.Cleanup(func() { tb.Close() })
+
+				err = New().Connect(config.Mqtt{
+					Server: tb.Addr(), CaPath: caPath, User: "hal", SkipHostnameVerify: skip,
+				})
+				if err == nil {
+					t.Fatal("Connect() = nil, want the handshake to fail")
+				}
+				if errors.Is(err, ErrConfig) {
+					t.Errorf("Connect() = %v\nclassified as a permanent configuration error, so the unit "+
+						"stops; a clock that has not caught up fixes itself on the next attempt", err)
+				}
+			})
+		}
+	}
+}
+
+// TestSANlessCertificateNamesTheEscapeHatch: the flag is the only way forward
+// from this failure, and an operator cannot guess the key from the error.
+func TestSANlessCertificateNamesTheEscapeHatch(t *testing.T) {
+	tb, caPath := startTestBrokerOpts(t, false)
+
+	err := New().Connect(config.Mqtt{Server: tb.Addr(), CaPath: caPath, User: "hal"})
+	if err == nil {
+		t.Fatal("Connect() = nil, want a certificate error")
+	}
+	if !strings.Contains(err.Error(), "skip-hostname-verify") {
+		t.Errorf("Connect() = %q, want it to name the option that resolves it", err)
+	}
+}
+
+// TestSkipHostnameVerifyStillChecksKeyUsage: the manual verification has to
+// keep the server-auth requirement, or a client certificate from the same CA
+// would be accepted as a broker.
+func TestSkipHostnameVerifyStillChecksKeyUsage(t *testing.T) {
+	dir := t.TempDir()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "client only"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.X509KeyPair(certPEM, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPath := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := tls.NewListener(raw, &tls.Config{Certificates: []tls.Certificate{cert}})
+	tb := serveTestBroker(ln)
+	t.Cleanup(func() { tb.Close() })
+
+	err = New().Connect(config.Mqtt{
+		Server: tb.Addr(), CaPath: caPath, User: "hal", SkipHostnameVerify: true,
+	})
+	if err == nil {
+		t.Fatal("Connect() = nil: a certificate valid only for client authentication was accepted as a broker")
+	}
 }

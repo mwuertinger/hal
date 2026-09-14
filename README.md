@@ -68,6 +68,19 @@ Three directives are deployment-specific and worth checking before first start:
   unit would then fail to start. btrfs, xfs and f2fs need the same treatment. The
   directive is inert unless `bpf` appears in `/sys/kernel/security/lsm`.
 
+The Pi has no real-time clock, so `hal.service` orders itself after
+`time-sync.target`. That ordering does nothing on its own: unless
+`systemd-time-wait-sync.service` is enabled, the target is reached immediately
+at boot. Enable it if you want HAL to wait for a correct clock:
+
+    systemctl enable --now systemd-time-wait-sync
+
+It matters when the broker's certificate has been reissued since the last clean
+shutdown, because timesyncd restores the clock from disk and the restored time
+predates the new certificate, which then reads as "not yet valid". HAL treats
+that as retryable rather than fatal in any case, so the unit recovers on its own
+either way; enabling the wait just avoids the failed attempts.
+
 A `.local` broker name will not resolve. The binary is built with `CGO_ENABLED=0`,
 and Go's own resolver does not speak mDNS even where `/etc/nsswitch.conf` lists
 `mdns4_minimal` — so `ping mosquitto.local` works from a shell while HAL reports
