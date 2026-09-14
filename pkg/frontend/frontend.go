@@ -301,11 +301,6 @@ func Start(httpConfig config.Http) error {
 		return errors.New("already started")
 	}
 
-	shutdown = make(chan interface{})
-	wg.Add(1)
-
-	go broadcast(device.Events())
-
 	// The goroutine closes over its own reference rather than reading the
 	// package variable, which Shutdown clears.
 	server := &http.Server{
@@ -324,14 +319,19 @@ func Start(httpConfig config.Http) error {
 	// caller as a startup error. Left to ListenAndServe it surfaced as a
 	// log.Fatalf from a goroutine, after main had already logged "Server ready"
 	// and without device or broker shutdown running.
+	// Before anything is started, so a failure here has nothing to unwind:
+	// device.Events() registers an observer channel and a fan-in goroutine per
+	// device, and releasing those on the error path is easy to get subtly
+	// wrong. Nothing between here and there needs the broadcaster.
 	listener, err := net.Listen("tcp", httpConfig.ListenAddress)
 	if err != nil {
-		srv = nil
-		close(shutdown)
-		wg.Wait()
 		return fmt.Errorf("listen on %s: %w", httpConfig.ListenAddress, err)
 	}
 	listenAddr = listener.Addr().String()
+
+	shutdown = make(chan interface{})
+	wg.Add(1)
+	go broadcast(device.Events())
 
 	srv = server
 

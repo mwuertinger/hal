@@ -1000,6 +1000,9 @@ func TestStartWiresEverythingTogether(t *testing.T) {
 	}
 	defer Shutdown()
 
+	if !strings.HasPrefix(listenAddr, "127.0.0.1:") {
+		t.Fatalf("bound %q, want the configured 127.0.0.1: http.listen-address is not reaching the listener", listenAddr)
+	}
 	base := "http://" + listenAddr
 
 	request := func(host string) int {
