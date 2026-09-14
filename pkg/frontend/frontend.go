@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -482,6 +483,7 @@ func broadcast(eventChan <-chan device.Event) {
 				case c.send <- event:
 				default:
 					log.Printf("WS %v: %d events behind, dropping", c.conn.RemoteAddr(), wsSendQueue)
+					wsFellBehind.Add(1)
 					delete(wsConnections, c)
 					close(c.send)
 				}
@@ -794,6 +796,14 @@ type wsClient struct {
 	conn *websocket.Conn
 	send chan device.Event
 }
+
+// wsFellBehind counts clients dropped for falling wsSendQueue events behind.
+// It exists so a test can assert that this path - and not the write deadline
+// behind it, which reaches the same end state seconds later - is what dropped a
+// client. Timing cannot separate them: under -race on one core the drop was
+// measured at up to 3.5s against a 5s deadline, so any wall-clock bound either
+// flakes or overlaps the thing it has to exclude.
+var wsFellBehind atomic.Uint64
 
 var (
 	// Allocated here rather than in Start, which assigned it without holding

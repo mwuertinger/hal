@@ -548,12 +548,20 @@ func TestWebsocketDeliversEvents(t *testing.T) {
 	testBroker.Deliver("stat/lamp1/POWER", "ON")
 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	var event device.Event
-	if err := conn.ReadJSON(&event); err != nil {
-		t.Fatalf("no event reached the browser: %v", err)
-	}
-	if event.DeviceId != "lamp1" {
-		t.Errorf("DeviceId = %q, want lamp1", event.DeviceId)
+	for {
+		var event device.Event
+		if err := conn.ReadJSON(&event); err != nil {
+			t.Fatalf("no event reached the browser: %v", err)
+		}
+		// A heartbeat decodes into an Event with no DeviceId. The two shapes are
+		// disjoint, but only the events are this test's business.
+		if event.DeviceId == "" {
+			continue
+		}
+		if event.DeviceId != "lamp1" {
+			t.Errorf("DeviceId = %q, want lamp1", event.DeviceId)
+		}
+		break
 	}
 }
 
@@ -571,6 +579,26 @@ func waitClients(t *testing.T, want int) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("registered clients = %d, want %d", clientCount(), want)
+}
+
+// clientCountWithin reads the client count, failing rather than hanging if the
+// lock is held. A blocked broadcaster parks on its send while holding
+// wsConnectionsMu, so an unbounded read here wedges the test goroutine before
+// it can reach any assertion - and the failure surfaces as a whole-binary
+// timeout minutes later, pointing at the wrong line.
+func clientCountWithin(t *testing.T, d time.Duration) int {
+	t.Helper()
+
+	got := make(chan int, 1)
+	go func() { got <- clientCount() }()
+
+	select {
+	case n := <-got:
+		return n
+	case <-time.After(d):
+		t.Fatal("wsConnectionsMu is still held: the broadcaster blocked on a client that stopped reading")
+		return -1
+	}
 }
 
 func clientCount() int {
@@ -771,6 +799,65 @@ func TestReaderDropsAClientThatStopsAnsweringPings(t *testing.T) {
 	waitClients(t, 0)
 }
 
+// TestHealthyClientSurvivesPings is the other half of
+// TestReaderDropsAClientThatStopsAnsweringPings: the read deadline must be
+// refreshed by each pong, not set once. Without the pong handler the deadline
+// expires on schedule regardless of how healthy the client is, which in
+// production drops every browser every wsPongTimeout - a reconnect loop on the
+// connection the page depends on.
+func TestHealthyClientSurvivesPings(t *testing.T) {
+	waitClients(t, 0)
+
+	const pongTimeout = 100 * time.Millisecond
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		client := &wsClient{conn: conn, send: make(chan device.Event, 1)}
+		if !addClient(client) {
+			conn.Close()
+			return
+		}
+		go writePump(client, pongTimeout/5)
+		go readPump(client, pongTimeout)
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Scheme = "ws"
+
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), http.Header{"Origin": {srv.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Reading is what makes gorilla answer the pings.
+	go func() {
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	waitClients(t, 1)
+
+	// Well past several pong timeouts: a client that answers must still be here.
+	deadline := time.Now().Add(pongTimeout * 8)
+	for time.Now().Before(deadline) {
+		if clientCount() == 0 {
+			t.Fatal("a client answering every ping was dropped: the read deadline is never refreshed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestSlowClientIsDropped: the broadcaster must never block on one unresponsive
 // browser. It is the only reader of device.Events(), and a write that blocks
 // stops it draining, which backs up into the device layer and the lock every
@@ -813,12 +900,14 @@ func TestSlowClientIsDropped(t *testing.T) {
 	// Push until the client is dropped: first its queue fills, then the socket
 	// stops accepting, then the broadcaster takes the drop path. Every send
 	// here must return promptly - that is the property under test.
-	// Two seconds, not twenty: dropping a slow client takes milliseconds, while
-	// the write deadline behind it takes wsWriteTimeout. A generous bound let
-	// that fallback stand in for the drop path, so the test passed with the
-	// drop path deleted.
-	deadline := time.Now().Add(2 * time.Second)
-	for i := 0; clientCount() > 0; i++ {
+	// The deadline is only a backstop. What distinguishes the broadcaster's drop
+	// from the write deadline that would eventually reach the same end state is
+	// the counter, checked below - not how long it took, which under -race on
+	// one core overlaps the deadline it would have to exclude.
+	fellBehind := wsFellBehind.Load()
+
+	deadline := time.Now().Add(20 * time.Second)
+	for i := 0; clientCountWithin(t, 5*time.Second) > 0; i++ {
 		if time.Now().After(deadline) {
 			t.Fatal("the client was never dropped")
 		}
@@ -834,6 +923,11 @@ func TestSlowClientIsDropped(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("the broadcaster blocked on a client that stopped reading")
 		}
+	}
+
+	if wsFellBehind.Load() == fellBehind {
+		t.Error("the client was dropped by the write deadline, not by the broadcaster: " +
+			"the queue-full path never fired")
 	}
 
 	// Dropping the client has to close the socket too. This is the one path
